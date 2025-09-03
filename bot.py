@@ -52,7 +52,7 @@ async def get_chat_participants(chat_id: int) -> List[Tuple[int, str]]:
                 participants = []
                 async for member in bot.get_chat_members(chat_id, limit=200):
                     if not member.user.is_bot:  # Исключаем ботов
-                        username = member.user.username or member.user.first_name or f"user{member.user.id}"
+                        username = member.user.first_name or member.user.username or f"user{member.user.id}"
                         participants.append((member.user.id, username))
                 
                 chat_participants_cache[cache_key] = participants
@@ -90,7 +90,7 @@ async def cmd_start(message: types.Message):
     await message.answer(
         "🎯 Добро пожаловать в игру «ГовноМёт»!\n\n"
         "💩 Просто нажми кнопку ниже, чтобы метнуть говна в случайного участника чата.\n\n"
-        "🎯 Или используй /go @username для метания в конкретного пользователя!\n\n"
+        "🎯 Или используй /go имя для метания в конкретного пользователя!\n\n"
         "🎲 Результат всегда случайный - можешь попасть в цель, промахнуться или устроить говнобум!\n\n"
         "🔥 Цель игры - превратить чат в говнохаос!\n"
         "💡 Работает в любом чате, даже с одним участником!",
@@ -111,7 +111,7 @@ async def cmd_help(message: types.Message):
         "🎯 <b>ГовноМёт - правила игры:</b>\n\n"
         "💩 <b>Как играть:</b>\n"
         "• Нажми кнопку «💩 Метнуть говна» для случайной цели\n"
-        "• Или используй /go @username для конкретной цели\n"
+        "• Или используй /go имя для конкретной цели\n"
         "• Результат будет показан в чате\n"
         "• Работает в любом чате, даже с одним участником!\n\n"
         "📊 <b>Статистика:</b>\n"
@@ -124,7 +124,7 @@ async def cmd_help(message: types.Message):
         "/ratings - показать рейтинги недели\n"
         "/refresh - обновить список участников\n"
         "/participants - показать список участников\n"
-        "/go @username - метнуть говно в конкретного пользователя\n\n"
+        "/go имя - метнуть говно в конкретного пользователя\n\n"
         "🔥 <b>Цель:</b> Устроить максимальный говнохаос в чате!"
     )
     
@@ -555,7 +555,7 @@ async def cmd_participants(message: types.Message):
         display_name = f"@{username}" if username and not username.startswith("user") else username
         participants_text += f"{i}. {display_name}\n"
     
-    participants_text += f"\n💡 Используйте команду /go @username для метания в конкретного пользователя"
+    participants_text += f"\n💡 Используйте команду /go имя для метания в конкретного пользователя"
     
     participants_msg = await message.answer(
         participants_text,
@@ -584,7 +584,7 @@ async def cmd_go(message: types.Message):
     # Проверяем, есть ли аргумент (username цели)
     if not message.text or len(message.text.split()) < 2:
         error_msg = await message.answer(
-            "💩 Использование: /go @username\n"
+            "💩 Использование: /go имя\n"
             "Пример: /go @ivan\n\n"
             "🎯 Метает говно в указанного пользователя!",
             reply_markup=get_throw_button()
@@ -631,11 +631,14 @@ async def cmd_go(message: types.Message):
         
         return
     
-    # Ищем цель по username
+    # Ищем цель по имени или username
     target_user = None
-    for user_id, username in participants:
-        if username.lower() == target_username.lower() or f"@{username.lower()}" == f"@{target_username.lower()}":
-            target_user = (user_id, username)
+    for user_id, display_name in participants:
+        # Проверяем точное совпадение имени/username (без учета регистра)
+        if (display_name.lower() == target_username.lower() or 
+            f"@{display_name.lower()}" == f"@{target_username.lower()}" or
+            display_name.lower().startswith(target_username.lower())):
+            target_user = (user_id, display_name)
             break
     
     if not target_user:

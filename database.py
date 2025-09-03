@@ -154,12 +154,17 @@ class Database:
                     ''', (user_id,))
                     logger.debug(f"🤡 Пользователь {user_id} промахнулся")
                 elif outcome == 'special' and not is_target:
-                    # Особые эффекты типа бумеранга
+                    # Особые эффекты типа бумеранга - проверяем, попал ли в себя
+                    # Это будет определяться в game_logic и передаваться через targets_json
+                    # Пока что не обновляем self_hits, так как нужен targets_json
+                    logger.debug(f"⚡ Пользователь {user_id} попал под особый эффект")
+                elif outcome == 'miss' and not is_target:
+                    # Промах - инициатор сам себя обосрал
                     cursor.execute('''
                         UPDATE users SET self_hits = self_hits + 1 
                         WHERE user_id = ?
                     ''', (user_id,))
-                    logger.debug(f"⚡ Пользователь {user_id} попал под особый эффект")
+                    logger.debug(f"🤡 Пользователь {user_id} сам себя обосрал")
                 
                 cursor.execute('''
                     UPDATE users SET last_activity = CURRENT_TIMESTAMP 
@@ -193,6 +198,33 @@ class Database:
                     INSERT OR REPLACE INTO chat_stats (chat_id, total_throws)
                     VALUES (?, COALESCE((SELECT total_throws FROM chat_stats WHERE chat_id = ?), 0) + 1)
                 ''', (chat_id, chat_id))
+                
+                # Обновляем статистику пользователя-инициатора
+                if outcome == 'direct_hit':
+                    cursor.execute('''
+                        UPDATE users SET direct_hits = COALESCE(direct_hits, 0) + 1 
+                        WHERE user_id = ?
+                    ''', (initiator_id,))
+                elif outcome == 'miss':
+                    cursor.execute('''
+                        UPDATE users SET misses = COALESCE(misses, 0) + 1, 
+                                       self_hits = COALESCE(self_hits, 0) + 1
+                        WHERE user_id = ?
+                    ''', (initiator_id,))
+                elif outcome == 'special':
+                    # Проверяем, попал ли инициатор в себя (например, бумеранг)
+                    if targets_json and str(initiator_id) in targets_json:
+                        cursor.execute('''
+                            UPDATE users SET self_hits = COALESCE(self_hits, 0) + 1 
+                            WHERE user_id = ?
+                        ''', (initiator_id,))
+                
+                # Обновляем статистику цели
+                if outcome == 'direct_hit':
+                    cursor.execute('''
+                        UPDATE users SET times_hit = COALESCE(times_hit, 0) + 1 
+                        WHERE user_id = ?
+                    ''', (target_id,))
                 
                 conn.commit()
                 logger.info(f"💩 Событие добавлено: {initiator_id} -> {target_id} ({outcome}) в чате {chat_id}")
@@ -466,18 +498,18 @@ class Database:
                 # Топ снайперов (лучший процент попаданий)
                 cursor.execute('''
                     SELECT u.username, 
-                           u.direct_hits,
-                           (u.direct_hits + u.misses + u.self_hits) as total_throws,
+                           COUNT(CASE WHEN e.outcome IN ('direct_hit', 'critical') THEN 1 END) as direct_hits,
+                           COUNT(*) as total_throws,
                            CASE 
-                               WHEN (u.direct_hits + u.misses + u.self_hits) > 0 
-                               THEN ROUND(u.direct_hits * 100.0 / (u.direct_hits + u.misses + u.self_hits), 1)
+                               WHEN COUNT(*) > 0 
+                               THEN ROUND(COUNT(CASE WHEN e.outcome IN ('direct_hit', 'critical') THEN 1 END) * 100.0 / COUNT(*), 1)
                                ELSE 0 
                            END as accuracy
                     FROM users u
                     JOIN events e ON u.user_id = e.initiator_id
                     WHERE e.chat_id = ? AND e.timestamp >= ?
                     GROUP BY u.user_id
-                    HAVING (u.direct_hits + u.misses + u.self_hits) >= 5
+                    HAVING COUNT(*) >= 5
                     ORDER BY accuracy DESC
                     LIMIT 3
                 ''', (chat_id, since_date))

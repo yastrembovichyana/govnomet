@@ -733,7 +733,7 @@ async def cmd_go(message: types.Message):
     
     # Обновляем расширенные данные пользователя в БД
     await db.update_user_heat(user.id, game_result.get('heat_at_throw', 0))
-    await db.update_user_score(user.id, game_result.get('score_delta', 0))
+    await db.update_score(user.id, game_result.get('score_delta', 0))
     if game_result.get('role_used'):
         expires_at = datetime.now() + timedelta(seconds=3600)  # 1 час
         await db.update_user_role(user.id, game_result['role_used'], expires_at.isoformat())

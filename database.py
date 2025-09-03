@@ -28,9 +28,27 @@ class Database:
                         misses INTEGER DEFAULT 0,
                         self_hits INTEGER DEFAULT 0,
                         times_hit INTEGER DEFAULT 0,
-                        last_activity TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                        last_activity TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        -- Новые поля для расширенной механики
+                        score INTEGER DEFAULT 0,
+                        heat INTEGER DEFAULT 0,
+                        last_role TEXT,
+                        role_expires_at TIMESTAMP,
+                        last_throw_ts TIMESTAMP
                     )
                 ''')
+                # Альтернативно добавляем недостающие колонки (если таблица уже существовала)
+                for col, ddl in [
+                    ("score", "ALTER TABLE users ADD COLUMN score INTEGER DEFAULT 0"),
+                    ("heat", "ALTER TABLE users ADD COLUMN heat INTEGER DEFAULT 0"),
+                    ("last_role", "ALTER TABLE users ADD COLUMN last_role TEXT"),
+                    ("role_expires_at", "ALTER TABLE users ADD COLUMN role_expires_at TIMESTAMP"),
+                    ("last_throw_ts", "ALTER TABLE users ADD COLUMN last_throw_ts TIMESTAMP"),
+                ]:
+                    try:
+                        cursor.execute(ddl)
+                    except Exception:
+                        pass
                 
                 # Таблица событий
                 cursor.execute('''
@@ -41,10 +59,28 @@ class Database:
                         outcome TEXT,
                         chat_id INTEGER,
                         timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        -- Новые поля метаданных события
+                        role_used TEXT,
+                        stacks_at_hit INTEGER,
+                        heat_at_hit INTEGER,
+                        was_reflect INTEGER DEFAULT 0,
+                        targets_json TEXT,
                         FOREIGN KEY (initiator_id) REFERENCES users (user_id),
                         FOREIGN KEY (target_id) REFERENCES users (user_id)
                     )
                 ''')
+                # Добавляем недостающие колонки в events, если нужно
+                for ddl in [
+                    "ALTER TABLE events ADD COLUMN role_used TEXT",
+                    "ALTER TABLE events ADD COLUMN stacks_at_hit INTEGER",
+                    "ALTER TABLE events ADD COLUMN heat_at_hit INTEGER",
+                    "ALTER TABLE events ADD COLUMN was_reflect INTEGER DEFAULT 0",
+                    "ALTER TABLE events ADD COLUMN targets_json TEXT",
+                ]:
+                    try:
+                        cursor.execute(ddl)
+                    except Exception:
+                        pass
                 
                 # Таблица статистики чатов
                 cursor.execute('''
@@ -52,6 +88,19 @@ class Database:
                         chat_id INTEGER PRIMARY KEY,
                         total_throws INTEGER DEFAULT 0,
                         last_rating_update TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                ''')
+
+                # Таблица фокуса между парами (инициатор -> цель)
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS focus_pairs (
+                        initiator_id INTEGER,
+                        target_id INTEGER,
+                        chat_id INTEGER,
+                        focus_stacks INTEGER DEFAULT 0,
+                        last_hit_ts TIMESTAMP,
+                        penalty_until TIMESTAMP,
+                        PRIMARY KEY (initiator_id, target_id, chat_id)
                     )
                 ''')
                 
@@ -124,15 +173,20 @@ class Database:
             logger.error(f"❌ Ошибка обновления статистики пользователя {user_id}: {e}")
     
     async def add_event(self, initiator_id: int, target_id: int, 
-                       outcome: str, chat_id: int) -> bool:
+                       outcome: str, chat_id: int,
+                       role_used: str = None,
+                       stacks_at_hit: int = None,
+                       heat_at_hit: int = None,
+                       was_reflect: int = 0,
+                       targets_json: str = None) -> bool:
         """Добавление события броска"""
         try:
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.cursor()
                 cursor.execute('''
-                    INSERT INTO events (initiator_id, target_id, outcome, chat_id)
-                    VALUES (?, ?, ?, ?)
-                ''', (initiator_id, target_id, outcome, chat_id))
+                    INSERT INTO events (initiator_id, target_id, outcome, chat_id, role_used, stacks_at_hit, heat_at_hit, was_reflect, targets_json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (initiator_id, target_id, outcome, chat_id, role_used, stacks_at_hit, heat_at_hit, was_reflect, targets_json))
                 
                 # Обновляем статистику чата
                 cursor.execute('''
@@ -147,6 +201,105 @@ class Database:
         except Exception as e:
             logger.error(f"❌ Ошибка добавления события: {e}")
             return False
+
+    # ---------------------- Расширенные операции ----------------------
+    async def get_user_extended(self, user_id: int) -> Optional[tuple]:
+        """Возвращает (score, heat, last_role, role_expires_at, last_throw_ts)"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    SELECT score, heat, last_role, role_expires_at, last_throw_ts
+                    FROM users WHERE user_id = ?
+                ''', (user_id,))
+                return cursor.fetchone()
+        except Exception as e:
+            logger.error(f"❌ Ошибка получения расширенных данных пользователя {user_id}: {e}")
+            return None
+
+    async def update_user_heat(self, user_id: int, delta: int = 1):
+        """Увеличивает heat (с зажимом 0..100)."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    UPDATE users SET heat = MAX(0, MIN(100, COALESCE(heat, 0) + ?)), last_activity = CURRENT_TIMESTAMP
+                    WHERE user_id = ?
+                ''', (delta, user_id))
+                conn.commit()
+        except Exception as e:
+            logger.error(f"❌ Ошибка обновления heat пользователя {user_id}: {e}")
+
+    async def update_user_role(self, user_id: int, role: str, expires_at: Optional[str]):
+        """Сохраняет выбранную роль и срок её действия."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    UPDATE users SET last_role = ?, role_expires_at = ?, last_activity = CURRENT_TIMESTAMP
+                    WHERE user_id = ?
+                ''', (role, expires_at, user_id))
+                conn.commit()
+        except Exception as e:
+            logger.error(f"❌ Ошибка обновления роли пользователя {user_id}: {e}")
+
+    async def update_user_last_throw(self, user_id: int):
+        """Фиксирует время последнего броска."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    UPDATE users SET last_throw_ts = CURRENT_TIMESTAMP, last_activity = CURRENT_TIMESTAMP
+                    WHERE user_id = ?
+                ''', (user_id,))
+                conn.commit()
+        except Exception as e:
+            logger.error(f"❌ Ошибка фиксации последнего броска пользователя {user_id}: {e}")
+
+    async def update_score(self, user_id: int, delta: int):
+        """Изменяет общий счёт игрока."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    UPDATE users SET score = COALESCE(score, 0) + ?, last_activity = CURRENT_TIMESTAMP
+                    WHERE user_id = ?
+                ''', (delta, user_id))
+                conn.commit()
+        except Exception as e:
+            logger.error(f"❌ Ошибка обновления счёта пользователя {user_id}: {e}")
+
+    async def get_focus(self, initiator_id: int, target_id: int, chat_id: int) -> Tuple[int, Optional[str], Optional[str]]:
+        """Возвращает (focus_stacks, last_hit_ts, penalty_until)."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    SELECT focus_stacks, last_hit_ts, penalty_until
+                    FROM focus_pairs WHERE initiator_id = ? AND target_id = ? AND chat_id = ?
+                ''', (initiator_id, target_id, chat_id))
+                row = cursor.fetchone()
+                if row:
+                    return row[0], row[1], row[2]
+                return 0, None, None
+        except Exception as e:
+            logger.error(f"❌ Ошибка получения фокуса пары {initiator_id}->{target_id} чата {chat_id}: {e}")
+            return 0, None, None
+
+    async def set_focus(self, initiator_id: int, target_id: int, chat_id: int, stacks: int, penalty_until: Optional[str] = None):
+        """Сохраняет focus_stacks и временные штрафы для пары инициатор→цель."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    INSERT INTO focus_pairs (initiator_id, target_id, chat_id, focus_stacks, last_hit_ts, penalty_until)
+                    VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
+                    ON CONFLICT(initiator_id, target_id, chat_id)
+                    DO UPDATE SET focus_stacks=excluded.focus_stacks, last_hit_ts=CURRENT_TIMESTAMP, penalty_until=excluded.penalty_until
+                ''', (initiator_id, target_id, chat_id, stacks, penalty_until))
+                conn.commit()
+        except Exception as e:
+            logger.error(f"❌ Ошибка сохранения фокуса пары {initiator_id}->{target_id}: {e}")
     
     async def get_chat_participants(self, chat_id: int) -> List[Tuple[int, str]]:
         """Получение списка участников чата (заглушка - в реальности нужно получать через Telegram API)"""

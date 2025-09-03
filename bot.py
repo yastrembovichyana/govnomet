@@ -675,15 +675,49 @@ async def cmd_go(message: types.Message):
         chat_id=chat_id
     )
     
-    # Добавляем событие в базу
+    # Проверяем на ошибки (кулдаун, самоцель и т.д.)
+    if 'error' in game_result:
+        error_msg = await message.answer(
+            game_result['message'],
+            reply_markup=get_throw_button()
+        )
+        # Удаляем сообщение об ошибке через 5 секунд
+        await asyncio.sleep(5)
+        try:
+            await error_msg.delete()
+        except Exception:
+            pass
+        return
+    
+    # Обновляем расширенные данные пользователя в БД
+    await db.update_user_heat(user.id, game_result.get('heat_at_throw', 0))
+    await db.update_user_score(user.id, game_result.get('score_delta', 0))
+    if game_result.get('role_used'):
+        expires_at = datetime.now() + timedelta(seconds=3600)  # 1 час
+        await db.update_user_role(user.id, game_result['role_used'], expires_at.isoformat())
+    await db.update_user_last_throw(user.id)
+    
+    # Добавляем событие в базу с новыми полями
     await db.add_event(
         initiator_id=user.id,
         target_id=target_user[0],
         outcome=game_result['outcome'],
-        chat_id=chat_id
+        chat_id=chat_id,
+        role_used=game_result.get('role_used'),
+        stacks_at_hit=game_result.get('focus_stacks', 0),
+        heat_at_hit=game_result.get('heat_at_throw', 0),
+        was_reflect=0,  # TODO: реализовать отражение
+        targets_json=str(game_result['targets'])
     )
     
-    # Обновляем статистику
+    # Обновляем фокус в БД
+    focus_stacks = game_result.get('focus_stacks', 0)
+    penalty_until = None
+    if focus_stacks > 3:  # Штраф за фокус
+        penalty_until = (datetime.now() + timedelta(seconds=300)).isoformat()  # 5 минут
+    await db.set_focus(user.id, target_user[0], chat_id, focus_stacks, penalty_until)
+    
+    # Обновляем базовую статистику
     await db.update_user_stats(user.id, game_result['outcome'], is_target=False)
     await db.update_user_stats(target_user[0], game_result['outcome'], is_target=True)
     
@@ -691,11 +725,39 @@ async def cmd_go(message: types.Message):
     emoji = game_logic.get_emoji_for_outcome(game_result['outcome'])
     result_message = f"{emoji} {game_result['message']}"
     
+    # Добавляем информацию о роли и heat
+    if game_result.get('role_used'):
+        role_names = {
+            'sniper': '🎯 Снайпер',
+            'bombardier': '💣 Бомбардир', 
+            'defender': '🛡️ Оборонец'
+        }
+        role_name = role_names.get(game_result['role_used'], game_result['role_used'])
+        result_message += f"\n\n🎭 {role_name}"
+    
+    if game_result.get('heat_at_throw', 0) > 50:
+        result_message += f"\n🔥 Репутация агрессора: {game_result['heat_at_throw']}/100"
+    
     # Отправляем результат
     await message.answer(
         result_message,
         reply_markup=get_throw_button()
     )
+    
+    # Отправляем публичные сигналы
+    if game_result.get('public_signals'):
+        signals = game_result['public_signals']
+        if signals.get('call_to_action'):
+            signals_msg = await message.answer(
+                f"📢 {signals['call_to_action']}",
+                reply_markup=get_throw_button()
+            )
+            # Удаляем сигналы через 15 секунд
+            await asyncio.sleep(15)
+            try:
+                await signals_msg.delete()
+            except Exception:
+                pass
     
     # Удаляем сообщение команды через 3 секунды
     await asyncio.sleep(GAME_SETTINGS['message_delete_delay'])

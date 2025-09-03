@@ -155,23 +155,7 @@ async def cmd_stats(message: types.Message):
     total_throws = chat_stats.get('total_throws', 0)
     stats_text += f"🎯 <b>Всего бросков:</b> {total_throws}\n"
     
-    # Статистика по исходам
-    outcomes = chat_stats.get('outcomes', {})
-    if outcomes:
-        stats_text += "\n📈 <b>Статистика по исходам:</b>\n"
-        outcome_names = {
-            'direct_hit': '🎯 Прямые попадания',
-            'miss': '🤡 Промахи',
-            'splash': '🤮 Разлетелось',
-            'special': '⚡ Особые эффекты',
-            'critical': '💥 Критические',
-            'combo': '🔄 Комбо',
-            'legendary': '👑 Легендарные'
-        }
-        for outcome, count in outcomes.items():
-            name = outcome_names.get(outcome, outcome)
-            percentage = round((count / total_throws) * 100, 1) if total_throws > 0 else 0
-            stats_text += f"• {name}: {count} ({percentage}%)\n"
+
     
     # Топ метателей
     top_throwers = chat_stats.get('top_throwers', [])
@@ -201,11 +185,7 @@ async def cmd_stats(message: types.Message):
         for i, (username, hits, total, accuracy) in enumerate(top_snipers, 1):
             stats_text += f"{i}. @{username}: {accuracy}% точность ({hits}/{total})\n"
     
-    # Самый активный день
-    most_active_day = chat_stats.get('most_active_day')
-    if most_active_day:
-        date, throws = most_active_day
-        stats_text += f"\n📅 <b>Самый активный день:</b> {date} ({throws} бросков)\n"
+
     
     # Игровая статистика
     if game_stats:

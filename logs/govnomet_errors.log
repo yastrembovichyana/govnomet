@@ -1,7 +1,0 @@
-2025-09-01 14:05:12 | ERROR    | govnomet        | ❌ Критическая ошибка запуска: 'GovnometLogger' object has no attribute 'error'
-2025-09-01 14:08:25 | ERROR    | govnomet        | ❌ Ошибка обработки броска: Telegram server says - Bad Request: query is too old and response timeout expired or query ID is invalid
-2025-09-01 14:51:41 | ERROR    | govnomet        | ❌ Ошибка обработки броска: can't subtract offset-naive and offset-aware datetimes
-2025-09-01 14:51:44 | ERROR    | govnomet        | ❌ Ошибка обработки броска: can't subtract offset-naive and offset-aware datetimes
-2025-09-01 14:52:01 | ERROR    | govnomet        | ❌ Ошибка обработки броска: can't subtract offset-naive and offset-aware datetimes
-2025-09-01 15:06:11 | ERROR    | govnomet        | ❌ Ошибка обработки броска: can't subtract offset-naive and offset-aware datetimes
-2025-09-01 15:12:47 | ERROR    | govnomet        | ❌ Ошибка обработки броска: can't subtract offset-naive and offset-aware datetimes

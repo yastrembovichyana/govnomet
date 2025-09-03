@@ -9,7 +9,7 @@ logger = get_logger('game')
 
 # Константы для новой механики
 ROLE_DURATION = 3600  # 1 час в секундах
-MIN_THROW_INTERVAL = 30  # Минимальный интервал между бросками
+MIN_THROW_INTERVAL = 5  # Минимальный интервал между бросками
 FOCUS_PENALTY_DURATION = 300  # 5 минут штрафа за фокус
 
 class GameLogic:
@@ -303,7 +303,8 @@ class GameLogic:
             logger.debug("📝 Форматирование целей: список пуст")
             return "никого"
         
-        usernames = [f"@{target[1]}" if target[1] else f"user{target[0]}" for target in targets]
+        # Добавляем @ к каждому имени пользователя
+        usernames = [f"@{target[1]}" if target[1] else f"@user{target[0]}" for target in targets]
         
         if len(usernames) == 1:
             result = usernames[0]
@@ -365,10 +366,10 @@ class GameLogic:
             
             # Формируем сообщение
             if outcome == 'direct_hit':
-                target = targets[0]
+                targets_text = self.format_targets_text(targets)
                 message = self.get_random_message(outcome, 
                                                initiator=initiator_username,
-                                               target=target[1] if target[1] else f"user{target[0]}")
+                                               targets=targets_text)
             
             elif outcome == 'miss':
                 message = self.get_random_message(outcome, initiator=initiator_username)
@@ -390,10 +391,10 @@ class GameLogic:
                                                    targets=targets_text)
             
             elif outcome == 'critical':
-                target = targets[0]
+                targets_text = self.format_targets_text(targets)
                 message = self.get_random_message(outcome, 
                                                initiator=initiator_username,
-                                               target=target[1] if target[1] else f"user{target[0]}")
+                                               targets=targets_text)
             
             elif outcome == 'combo':
                 targets_text = self.format_targets_text(targets)
@@ -517,22 +518,24 @@ class GameLogic:
             
             # Формируем сообщение в зависимости от исхода
             if outcome == 'direct_hit':
+                targets = [(target_id, target_username)]
+                targets_text = self.format_targets_text(targets)
                 message = self.get_random_message(outcome, 
                                                initiator=initiator_username,
-                                               target=target_username)
-                targets = [(target_id, target_username)]
+                                               targets=targets_text)
             
             elif outcome == 'miss':
-                message = self.get_random_message(outcome, initiator=initiator_username)
                 targets = [(initiator_id, initiator_username)]
+                message = self.get_random_message(outcome, initiator=initiator_username)
             
             elif outcome == 'splash':
                 # Разлетелось - цель + случайные дополнительные
                 targets = [(target_id, target_username)]
                 # Здесь можно добавить логику для дополнительных целей
+                targets_text = self.format_targets_text(targets)
                 message = self.get_random_message(outcome, 
                                                initiator=initiator_username,
-                                               targets=f"{target_username} и других")
+                                               targets=targets_text)
             
             elif outcome == 'special':
                 # Особые эффекты для целевого броска
@@ -540,17 +543,26 @@ class GameLogic:
                 logger.debug(f"⚡ Особый эффект для целевого броска: {effect_type}")
                 
                 if effect_type == 'boomerang':
-                    message = f"{initiator_username} метнул говно в @{target_username}, но оно вернулось бумерангом! 🤡💩"
                     targets = [(initiator_id, initiator_username)]
+                    message = self.get_random_message(outcome, initiator=initiator_username)
                 elif effect_type == 'avalanche':
-                    message = f"{initiator_username} метнул говно в @{target_username}, но устроил говнолавину! 🌨️💩"
                     targets = [(target_id, target_username)]
+                    targets_text = self.format_targets_text(targets)
+                    message = self.get_random_message(outcome, 
+                                                   initiator=initiator_username,
+                                                   targets=targets_text)
                 elif effect_type == 'brick':
-                    message = f"{initiator_username} метнул говно в @{target_username}, но попал кирпичом! 🧱💩"
                     targets = [(target_id, target_username)]
+                    targets_text = self.format_targets_text(targets)
+                    message = self.get_random_message(outcome, 
+                                                   initiator=initiator_username,
+                                                   targets=targets_text)
                 elif effect_type == 'bomb':
-                    message = f"{initiator_username} метнул говно в @{target_username}, но оно взорвалось! 💣💩"
                     targets = [(target_id, target_username)]
+                    targets_text = self.format_targets_text(targets)
+                    message = self.get_random_message(outcome, 
+                                                   initiator=initiator_username,
+                                                   targets=targets_text)
             
             result = {
                 'outcome': outcome,

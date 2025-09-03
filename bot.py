@@ -351,6 +351,23 @@ async def process_throw_shit(callback: types.CallbackQuery):
             chat_id=chat_id
         )
         
+        # Если кулдаун — показываем сообщение и удаляем через 5 сек
+        if isinstance(game_result, dict) and game_result.get('error') == 'cooldown':
+            cooldown_msg = await callback.message.answer(
+                f"⏰ {game_result['message']}",
+                reply_markup=get_throw_button()
+            )
+            await asyncio.sleep(5)
+            try:
+                await cooldown_msg.delete()
+            except Exception:
+                pass
+            try:
+                await callback.answer("⏰ Подожди немного…")
+            except Exception:
+                pass
+            return
+        
         # Добавляем событие в базу
         for target in game_result['targets']:
             await db.add_event(
@@ -433,6 +450,23 @@ async def handle_manual_throw(message: types.Message):
                     participants=participants,
                     chat_id=chat_id
                 )
+                
+                # Если кулдаун — показываем сообщение и удаляем через 5 сек
+                if isinstance(game_result, dict) and game_result.get('error') == 'cooldown':
+                    cooldown_msg = await message.answer(
+                        f"⏰ {game_result['message']}",
+                        reply_markup=get_throw_button()
+                    )
+                    await asyncio.sleep(5)
+                    try:
+                        await cooldown_msg.delete()
+                    except Exception:
+                        pass
+                    try:
+                        await message.answer("⏰ Подожди немного…")
+                    except Exception:
+                        pass
+                    return
                 
                 # Добавляем событие в базу
                 for target in game_result['targets']:
@@ -674,6 +708,19 @@ async def cmd_go(message: types.Message):
         target_username=target_user[1],
         chat_id=chat_id
     )
+    
+    # Если кулдаун — показываем сообщение и удаляем через 5 сек
+    if isinstance(game_result, dict) and game_result.get('error') == 'cooldown':
+        cooldown_msg = await message.answer(
+            f"⏰ {game_result['message']}",
+            reply_markup=get_throw_button()
+        )
+        await asyncio.sleep(5)
+        try:
+            await cooldown_msg.delete()
+        except Exception:
+            pass
+        return
     
     # Проверяем на ошибки (кулдаун, самоцель и т.д.)
     if 'error' in game_result:

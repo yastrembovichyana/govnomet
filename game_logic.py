@@ -303,8 +303,8 @@ class GameLogic:
             logger.debug("📝 Форматирование целей: список пуст")
             return "никого"
         
-        # НЕ добавляем @ к именам, так как в шаблонах уже используется @{targets}
-        usernames = [target[1] if target[1] else f"user{target[0]}" for target in targets]
+        # Добавляем @ к каждому имени пользователя
+        usernames = [f"@{target[1]}" if target[1] else f"@user{target[0]}" for target in targets]
         
         if len(usernames) == 1:
             result = usernames[0]

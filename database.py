@@ -91,6 +91,20 @@ class Database:
                     )
                 ''')
 
+                # Таблица ролей
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS roles (
+                        role_key TEXT PRIMARY KEY,
+                        role_name TEXT NOT NULL,
+                        emoji TEXT NOT NULL,
+                        description TEXT NOT NULL,
+                        bonuses TEXT NOT NULL,
+                        penalties TEXT,
+                        special_effects TEXT,
+                        style TEXT NOT NULL
+                    )
+                ''')
+                
                 # Таблица фокуса между парами (инициатор -> цель)
                 cursor.execute('''
                     CREATE TABLE IF NOT EXISTS focus_pairs (
@@ -106,6 +120,9 @@ class Database:
                 
                 conn.commit()
                 logger.info("✅ База данных инициализирована успешно")
+                
+                # Инициализируем роли, если таблица пустая
+                self.init_roles()
                 
         except Exception as e:
             logger.error(f"❌ Ошибка инициализации БД: {e}")
@@ -148,23 +165,46 @@ class Database:
                         ''', (user_id,))
                         logger.debug(f"🎯 Пользователь {user_id} совершил попадание")
                 elif outcome == 'miss':
-                    cursor.execute('''
-                        UPDATE users SET misses = misses + 1 
-                        WHERE user_id = ?
-                    ''', (user_id,))
-                    logger.debug(f"🤡 Пользователь {user_id} промахнулся")
-                elif outcome == 'special' and not is_target:
-                    # Особые эффекты типа бумеранга - проверяем, попал ли в себя
-                    # Это будет определяться в game_logic и передаваться через targets_json
-                    # Пока что не обновляем self_hits, так как нужен targets_json
-                    logger.debug(f"⚡ Пользователь {user_id} попал под особый эффект")
-                elif outcome == 'miss' and not is_target:
-                    # Промах - инициатор сам себя обосрал
-                    cursor.execute('''
-                        UPDATE users SET self_hits = self_hits + 1 
-                        WHERE user_id = ?
-                    ''', (user_id,))
-                    logger.debug(f"🤡 Пользователь {user_id} сам себя обосрал")
+                    if is_target:
+                        # Цель получила промах (не должно происходить)
+                        logger.debug(f"🤡 Пользователь {user_id} получил промах как цель")
+                    else:
+                        # Инициатор промахнулся - сам себя обосрал
+                        cursor.execute('''
+                            UPDATE users SET self_hits = self_hits + 1 
+                            WHERE user_id = ?
+                        ''', (user_id,))
+                        logger.debug(f"🤡 Пользователь {user_id} сам себя обосрал")
+                elif outcome == 'splash':
+                    if is_target:
+                        # Цель получила разлёт
+                        cursor.execute('''
+                            UPDATE users SET times_hit = times_hit + 1 
+                            WHERE user_id = ?
+                        ''', (user_id,))
+                        logger.debug(f"💥 Пользователь {user_id} получил разлёт")
+                    else:
+                        # Инициатор совершил разлёт
+                        cursor.execute('''
+                            UPDATE users SET direct_hits = direct_hits + 1 
+                            WHERE user_id = ?
+                        ''', (user_id,))
+                        logger.debug(f"💥 Пользователь {user_id} совершил разлёт")
+                elif outcome == 'special':
+                    if is_target:
+                        # Цель получила особый эффект
+                        cursor.execute('''
+                            UPDATE users SET times_hit = times_hit + 1 
+                            WHERE user_id = ?
+                        ''', (user_id,))
+                        logger.debug(f"⚡ Пользователь {user_id} получил особый эффект")
+                    else:
+                        # Инициатор попал под особый эффект (бумеранг и т.д.)
+                        cursor.execute('''
+                            UPDATE users SET self_hits = self_hits + 1 
+                            WHERE user_id = ?
+                        ''', (user_id,))
+                        logger.debug(f"⚡ Пользователь {user_id} попал под особый эффект")
                 
                 cursor.execute('''
                     UPDATE users SET last_activity = CURRENT_TIMESTAMP 
@@ -358,18 +398,19 @@ class Database:
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.cursor()
                 since_date = datetime.now() - timedelta(days=days)
+                since_str = since_date.isoformat()
                 
                 # Король говна (больше всего попаданий)
                 cursor.execute('''
-                    SELECT u.username, u.direct_hits
+                    SELECT u.username, COUNT(*) as hits
                     FROM users u
                     JOIN events e ON u.user_id = e.initiator_id
-                    WHERE e.chat_id = ? AND e.outcome = 'direct_hit' 
-                    AND e.timestamp >= ?
+                    WHERE e.chat_id = ? AND e.outcome = 'direct_hit'
+                      AND e.timestamp >= ?
                     GROUP BY u.user_id
-                    ORDER BY COUNT(*) DESC
+                    ORDER BY hits DESC
                     LIMIT 1
-                ''', (chat_id, since_date))
+                ''', (chat_id, since_str))
                 king = cursor.fetchone()
                 
                 # Главный обосранный (чаще всего страдал)
@@ -377,25 +418,27 @@ class Database:
                     SELECT u.username, COUNT(*) as hit_count
                     FROM users u
                     JOIN events e ON u.user_id = e.target_id
-                    WHERE e.chat_id = ? AND e.outcome = 'direct_hit' 
-                    AND e.timestamp >= ?
+                    WHERE e.chat_id = ? AND e.outcome = 'direct_hit'
+                      AND e.timestamp >= ?
                     GROUP BY u.user_id
                     ORDER BY hit_count DESC
                     LIMIT 1
-                ''', (chat_id, since_date))
+                ''', (chat_id, since_str))
                 victim = cursor.fetchone()
                 
                 # Долбоёб недели (чаще всех сам себя обосрал)
                 cursor.execute('''
-                    SELECT u.username, u.self_hits
+                    SELECT u.username,
+                           SUM(CASE WHEN e.outcome = 'miss' THEN 1 ELSE 0 END)
+                         + SUM(CASE WHEN e.outcome = 'special' AND e.targets_json LIKE '%' || u.user_id || '%' THEN 1 ELSE 0 END) AS self_count
                     FROM users u
                     JOIN events e ON u.user_id = e.initiator_id
-                    WHERE e.chat_id = ? AND e.outcome = 'special' 
-                    AND e.timestamp >= ?
+                    WHERE e.chat_id = ? AND e.timestamp >= ?
                     GROUP BY u.user_id
-                    ORDER BY u.self_hits DESC
+                    HAVING self_count > 0
+                    ORDER BY self_count DESC
                     LIMIT 1
-                ''', (chat_id, since_date))
+                ''', (chat_id, since_str))
                 idiot = cursor.fetchone()
                 
                 logger.info(f"🏆 Рейтинги для чата {chat_id} за {days} дней получены")
@@ -409,31 +452,39 @@ class Database:
             logger.error(f"❌ Ошибка получения рейтингов для чата {chat_id}: {e}")
             return {}
     
-    async def get_user_stats(self, user_id: int) -> dict:
-        """Получение статистики конкретного пользователя"""
+    async def get_user_stats(self, user_id: int, chat_id: int) -> dict:
+        """Получение статистики конкретного пользователя в конкретном чате"""
         try:
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.cursor()
+                
+                # Получаем статистику из событий по чату
                 cursor.execute('''
-                    SELECT direct_hits, misses, self_hits, times_hit
-                    FROM users WHERE user_id = ?
-                ''', (user_id,))
+                    SELECT 
+                        SUM(CASE WHEN outcome = 'direct_hit' AND initiator_id = ? THEN 1 ELSE 0 END) as direct_hits,
+                        SUM(CASE WHEN outcome = 'splash' AND initiator_id = ? THEN 1 ELSE 0 END) as splash_hits,
+                        SUM(CASE WHEN outcome = 'miss' AND initiator_id = ? THEN 1 ELSE 0 END) as self_hits,
+                        SUM(CASE WHEN (outcome = 'direct_hit' OR outcome = 'splash' OR outcome = 'special') AND target_id = ? THEN 1 ELSE 0 END) as times_hit
+                    FROM events 
+                    WHERE chat_id = ? AND (initiator_id = ? OR target_id = ?)
+                ''', (user_id, user_id, user_id, user_id, chat_id, user_id, user_id))
+                
                 result = cursor.fetchone()
                 
                 if result:
                     stats = {
-                        'direct_hits': result[0],
-                        'misses': result[1],
-                        'self_hits': result[2],
-                        'times_hit': result[3]
+                        'direct_hits': result[0] or 0,
+                        'misses': 0,  # misses теперь считаются как self_hits
+                        'self_hits': result[2] or 0,
+                        'times_hit': result[3] or 0
                     }
-                    logger.debug(f"📊 Статистика пользователя {user_id}: {stats}")
+                    logger.debug(f"📊 Статистика пользователя {user_id} в чате {chat_id}: {stats}")
                     return stats
-                logger.warning(f"⚠️ Пользователь {user_id} не найден в БД")
+                logger.warning(f"⚠️ Пользователь {user_id} не найден в чате {chat_id}")
                 return {}
                 
         except Exception as e:
-            logger.error(f"❌ Ошибка получения статистики пользователя {user_id}: {e}")
+            logger.error(f"❌ Ошибка получения статистики пользователя {user_id} в чате {chat_id}: {e}")
             return {}
     
     async def get_chat_stats(self, chat_id: int, days: int = 30) -> dict:
@@ -626,3 +677,117 @@ class Database:
         except Exception as e:
             logger.error(f"❌ Ошибка получения игровой статистики чата {chat_id}: {e}")
             return {}
+    
+    def init_roles(self):
+        """Инициализация ролей в базе данных"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                
+                # Проверяем, есть ли уже роли в БД
+                cursor.execute("SELECT COUNT(*) FROM roles")
+                count = cursor.fetchone()[0]
+                
+                if count > 0:
+                    logger.info("🎭 Роли уже инициализированы в БД")
+                    return
+                
+                # Данные всех ролей
+                roles_data = [
+                    # Базовые роли
+                    ('sniper', '🎯 Снайпер', '🎯', 'Мастер точности', 
+                     '+50% к прямому попаданию, -30% к разлёту', None, None, 'Точечные удары, минимальный урон по невиновным'),
+                    
+                    ('bombardier', '💣 Бомбардир', '💣', 'Массовое поражение',
+                     '+80% к разлёту, -20% к точности', None, None, 'Хаотичные взрывы, много жертв одновременно'),
+                    
+                    ('defender', '🛡️ Оборонец', '🛡️', 'Защитник',
+                     'Повышенный шанс отражения атак', None, None, 'Защитная тактика, отбивает атаки обратно'),
+                    
+                    # Обидные роли
+                    ('drunk_sniper', '🍺🎯 Снайпер-пьяница', '🍺🎯', 'Точность с риском',
+                     '+30% к точности в обычном состоянии', 'При жаре ≥50 шанс промаха удваивается', 'Чем больше агрессии, тем хуже прицел', 'Точность с риском'),
+                    
+                    ('berserker', '🪓 Берсерк', '🪓', 'Ярость и мощь',
+                     '+60% к критическим ударам, +50% к комбо', 'Каждый бросок +5 к жару, штраф к промаху не уменьшается', None, 'Агрессивная атака без пощады'),
+                    
+                    ('trickster', '🃏 Трикстер', '🃏', 'Мастер обмана',
+                     '+40% к особым эффектам', None, '10% шанс превратить попадание в "бумеранг" по метателю', 'Непредсказуемые трюки и розыгрыши'),
+                    
+                    # Тактические роли
+                    ('magnet', '🧲 Магнит', '🧲', 'Фокус-мастер',
+                     'Первый удар по цели даёт +1 к фокусу мгновенно', None, 'При фокусе >2 шанс прямого попадания ↑', 'Концентрированная атака на одну цель'),
+                    
+                    ('saboteur', '🕳️ Саботажник', '🕳️', 'Подрывник',
+                     'Снижает точность цели в ответ', '+30% к промаху цели на 10 минут', 'Психологическая война', 'Подрывная деятельность'),
+                    
+                    ('oracle', '🔮 Оракул', '🔮', 'Предсказатель',
+                     'Кулдаун -40% (быстрее бросает)', 'Вес "legendary" урезан в 2 раза', 'Умеет тащить "brick" вместо "miss"', 'Частые, но менее мощные атаки'),
+                    
+                    # Огненные роли
+                    ('pyromaniac', '🔥 Пироман', '🔥', 'Мастер огня',
+                     'Жар растёт вдвое быстрее', None, 'При жаре ≥20 получает +50% к криту, при жаре ≥80 шанс "special: bomb/rain"↑', 'Эскалация агрессии до взрыва'),
+                    
+                    ('shieldbearer', '🛡️ Щитоносец', '🛡️', 'Непробиваемый',
+                     'Шанс авто-рефлекта малых ударов', None, 'Фокус по нему накапливается медленнее', 'Оборонительная тактика с контратаками'),
+                    
+                    # Специализированные роли
+                    ('collector', '📎 Коллектор', '📎', 'Охотник за целями',
+                     '+40% к точности по тем, по кому уже есть фокус', 'Против свежих целей обычная точность', None, 'Добивание уже раненых целей'),
+                    
+                    ('teleporter', '🌀 Телепортер', '🌀', 'Перекидыватель',
+                     '15% шанс перекинуть цель на рандомного участника', None, 'Цель "телепортируется" к другому игроку', 'Хаотичные перенаправления'),
+                    
+                    ('rocketeer', '🚀 Говноракетчик', '🚀', 'Ракетный удар',
+                     '+30% к разлёту, +20% к особым эффектам', '-10% к точности', None, 'Мощные, но неточные залпы'),
+                    
+                    # Грязные роли
+                    ('snot_sniper', '🤧 Сопля-снайпер', '🤧', 'Слизистый стрелок',
+                     '+10% к промаху', '20% шанс удвоить промах', 'Случайные "сопливые" промахи', 'Непредсказуемая точность'),
+                    
+                    ('acid_clown', '🧪🤡 Кислотный клоун', '🧪🤡', 'Химический террор',
+                     'Особые химические эффекты', None, 'Токсичные розыгрыши и химические атаки', 'Химическая война'),
+                    
+                    ('counter_guru', '🔁 Обратка-гуру', '🔁', 'Мастер контратак',
+                     'Специализация на ответных ударах', None, 'Контратаки и ответные удары', 'Мастерство контратак')
+                ]
+                
+                # Вставляем роли в БД
+                cursor.executemany('''
+                    INSERT INTO roles (role_key, role_name, emoji, description, bonuses, penalties, special_effects, style)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ''', roles_data)
+                
+                conn.commit()
+                logger.info(f"🎭 Инициализировано {len(roles_data)} ролей в БД")
+                
+        except Exception as e:
+            logger.error(f"❌ Ошибка инициализации ролей: {e}")
+    
+    async def get_role_info(self, role_key: str) -> Optional[dict]:
+        """Получение информации о роли"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    SELECT role_key, role_name, emoji, description, bonuses, penalties, special_effects, style
+                    FROM roles WHERE role_key = ?
+                ''', (role_key,))
+                result = cursor.fetchone()
+                
+                if result:
+                    return {
+                        'role_key': result[0],
+                        'role_name': result[1],
+                        'emoji': result[2],
+                        'description': result[3],
+                        'bonuses': result[4],
+                        'penalties': result[5],
+                        'special_effects': result[6],
+                        'style': result[7]
+                    }
+                return None
+                
+        except Exception as e:
+            logger.error(f"❌ Ошибка получения информации о роли {role_key}: {e}")
+            return None

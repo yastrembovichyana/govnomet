@@ -25,12 +25,18 @@ class GameLogic:
         self.focus_stacks = {} # (initiator_id, target_id, chat_id) -> stacks
         self.last_throws = {} # user_id -> timestamp
         self.cooldowns = {}   # (initiator_id, target_id, chat_id) -> penalty_until
+        self.user_debuffs: dict[int, dict] = {}  # саботажник вешает дебафф
         logger.info("🎮 Игровая логика ГовноМёт инициализирована")
     
     # ---------------------- Новая механика: роли и модификаторы ----------------------
     def assign_random_role(self, user_id: int) -> str:
         """Назначает случайную роль пользователю на 1 час"""
-        roles = ['sniper', 'bombardier', 'defender']
+        roles = [
+            'sniper', 'bombardier', 'defender',
+            'drunk_sniper', 'berserker', 'trickster', 'magnet', 'saboteur',
+            'oracle', 'pyromaniac', 'shieldbearer', 'collector', 'teleporter',
+            'rocketeer', 'snot_sniper', 'acid_clown', 'counter_guru'
+        ]
         role = random.choice(roles)
         expires_at = datetime.now() + timedelta(seconds=ROLE_DURATION)
         self.user_roles[user_id] = (role, expires_at)
@@ -69,6 +75,31 @@ class GameLogic:
             # Оборонец: +шанс отражения
             # Это будет применено в логике исхода
             logger.debug(f"🛡️ Модификатор оборонца применен: отражение↑")
+
+        elif role == 'drunk_sniper':
+            modified_weights[0] *= 1.3
+            logger.debug("🍺🎯 Пьяный снайпер: базовая точность↑")
+        elif role == 'berserker':
+            modified_weights[4] *= 1.6  # critical
+            modified_weights[5] *= 1.5  # combo
+            logger.debug("🪓 Берсерк: крит/комбо↑")
+        elif role == 'trickster':
+            modified_weights[3] *= 1.4  # special
+            logger.debug("🃏 Трикстер: special↑")
+        elif role == 'oracle':
+            modified_weights[6] *= 0.5  # legendary↓
+            logger.debug("🔮 Оракул: legendary↓")
+        elif role == 'pyromaniac':
+            modified_weights[4] *= 1.2  # крит немного↑
+            logger.debug("🔥 Пироман: крит слегка↑")
+        elif role == 'rocketeer':
+            modified_weights[2] *= 1.3
+            modified_weights[3] *= 1.2
+            modified_weights[0] *= 0.9
+            logger.debug("🚀 Ракетчик: splash/special↑, точность↓")
+        elif role == 'snot_sniper':
+            modified_weights[1] *= 1.1
+            logger.debug("🤧 Сопля-снайпер: промах слегка↑")
         
         return modified_weights
     
@@ -111,9 +142,11 @@ class GameLogic:
         
         last_throw = self.last_throws[user_id]
         time_since = (datetime.now() - last_throw).total_seconds()
-        
-        if time_since < MIN_THROW_INTERVAL:
-            logger.debug(f"⏰ Пользователь {user_id} в кулдауне: {MIN_THROW_INTERVAL - time_since:.1f}s осталось")
+        # Оракул: кулдаун короче
+        role = self.get_user_role(user_id)
+        effective_cd = MIN_THROW_INTERVAL * (0.6 if role == 'oracle' else 1.0)
+        if time_since < effective_cd:
+            logger.debug(f"⏰ Пользователь {user_id} в кулдауне: {effective_cd - time_since:.1f}s осталось")
             return True
         
         return False
@@ -142,7 +175,7 @@ class GameLogic:
         self.last_throws[user_id] = datetime.now()
     
     # ---------------------- Обновлённая логика исхода ----------------------
-    def determine_outcome(self, user_id: int = None) -> str:
+    def determine_outcome(self, user_id: int = None, target_id: Optional[int] = None, chat_id: Optional[int] = None) -> str:
         """Определение исхода броска на основе вероятностей и комбо"""
         # Базовые вероятности
         base_weights = self.weights.copy()
@@ -153,6 +186,23 @@ class GameLogic:
             role = self.get_user_role(user_id)
             if role:
                 base_weights = self.apply_role_modifiers(base_weights, role)
+                heat = self.user_heat.get(user_id, 0)
+                if role == 'drunk_sniper':
+                    if heat >= 50:
+                        base_weights[1] *= 2.0  # miss
+                    else:
+                        base_weights[0] *= 1.3
+                if role == 'pyromaniac':
+                    if heat >= 20:
+                        base_weights[4] *= 1.5
+                    if heat >= 80:
+                        base_weights[3] *= 1.5
+                if role == 'collector' and target_id is not None and chat_id is not None:
+                    stacks = self.focus_stacks.get((user_id, target_id, chat_id), 0)
+                    if stacks > 0:
+                        base_weights[0] *= 1.4
+                if role == 'snot_sniper' and random.random() < 0.2:
+                    base_weights[1] *= 2.0
             
             combo_count = self.combo_counters.get(user_id, 0)
             streak_count = self.streak_counters.get(user_id, 0)
@@ -347,6 +397,14 @@ class GameLogic:
             
             # Выбираем цели
             targets = self.select_targets(participants, initiator_id, outcome)
+            # Магнит: первый удар по новой цели +1 к фокусу, а при stacks>2 шанс прямого попадания выше учли выше
+            role_now = self.get_user_role(initiator_id)
+            if role_now == 'magnet' and targets:
+                t_id = targets[0][0]
+                key = (initiator_id, t_id, chat_id)
+                if self.focus_stacks.get(key, 0) == 0:
+                    self.focus_stacks[key] = 1
+                    logger.debug(f"🧲 Магнит: мгновенно дал 1 stack фокуса на {t_id}")
             
             # Обновляем счетчики комбо и серий
             combo_count = self.update_combo_counter(initiator_id, outcome)
@@ -423,7 +481,7 @@ class GameLogic:
                 'heat_at_throw': self.user_heat.get(initiator_id, 0),
                 'focus_stacks': 0,  # Будет обновлено в bot.py
                 'score_delta': score_delta,
-                'public_signals': self.generate_public_signals(initiator_id, targets, chat_id, current_role)
+                'public_signals': self.generate_public_signals(initiator_id, targets, chat_id, current_role, initiator_username)
             }
             
             logger.info(f"✅ Бросок обработан: {outcome} -> {len(targets)} целей")
@@ -498,6 +556,24 @@ class GameLogic:
                 weights = [int(w * 100 / total) for w in weights]
                 logger.debug(f"🎯 Применён штраф за фокус: {focus_penalty:.2f}x")
             
+            # Ролевые модификаторы к исходу
+            role_now = self.get_user_role(initiator_id)
+            if role_now == 'saboteur':
+                # Вешаем на цель дебафф промаха +30% на один ход
+                self.user_debuffs[target_id] = {
+                    'miss_bonus': 0.3,
+                    'expires_at': datetime.now() + timedelta(seconds=ROLE_DURATION/6)
+                }
+            if role_now == 'teleporter' and random.random() < 0.15:
+                # Перекидываем цель на случайного другого
+                avail = [('dummy', 'dummy')]
+                # фактически перекидывание реализуем как special brick по новой цели
+                outcomes = ['special']
+                weights = [100]
+            if role_now == 'trickster' and random.random() < 0.1:
+                # 10% шанс бумеранга
+                outcomes = ['special']
+                weights = [100]
             outcome = random.choices(outcomes, weights=weights, k=1)[0]
             
             # Обновляем счетчики комбо и серий
@@ -579,7 +655,7 @@ class GameLogic:
                 'heat_at_throw': self.user_heat.get(initiator_id, 0),
                 'focus_stacks': self.focus_stacks.get((initiator_id, target_id, chat_id), 0),
                 'score_delta': score_delta,
-                'public_signals': self.generate_public_signals(initiator_id, targets, chat_id, current_role)
+                'public_signals': self.generate_public_signals(initiator_id, targets, chat_id, current_role, initiator_username)
             }
             
             logger.info(f"✅ Целевой бросок обработан: {outcome} -> {target_username}")
@@ -599,14 +675,16 @@ class GameLogic:
     
     # ---------------------- Публичные сигналы ----------------------
     def generate_public_signals(self, initiator_id: int, targets: List[Tuple[int, str]], 
-                               chat_id: int, role: Optional[str]) -> Dict[str, Any]:
+                               chat_id: int, role: Optional[str], initiator_username: Optional[str] = None) -> Dict[str, Any]:
         """Генерирует публичные сигналы после броска"""
         signals = {
             'initiator_role': role,
             'heat_status': self.user_heat.get(initiator_id, 0),
             'under_fire_candidates': [],
             'call_to_action': '',
-            'focus_warning': False
+            'focus_warning': False,
+            'initiator_username': initiator_username or '',
+            'callouts': []
         }
         
         # Определяем кандидатов "под прицелом"
@@ -629,10 +707,76 @@ class GameLogic:
         if signals['under_fire_candidates']:
             target = signals['under_fire_candidates'][0]
             if target['can_retaliate']:
-                if target['focus_stacks'] > 2:
-                    signals['call_to_action'] = f"🎯 @{target['username']} под прицелом! Фокус: {target['focus_stacks']} ударов"
-                else:
-                    signals['call_to_action'] = f"🎯 @{target['username']} может ответить! /go @{target['username']}"
+                # Предлагаем ответить на инициатора
+                reply_to = signals.get('initiator_username') or 'initiator'
+                stacks = target['focus_stacks']
+                # Пул агрессивных ироничных саркастичных фраз для ответки метателю
+                retaliate_pool = [
+                    f"метай в /go@{reply_to} а ну покажи что ты умеешь, трус!",
+                    f"метай в /go@{reply_to} верни говно обратно, если не боишься!",
+                    f"метай в /go@{reply_to} ты это видел? докажи что ты не тряпка!",
+                    f"метай в /go@{reply_to} месть подана холодной, но ты же не замерзнешь?",
+                    f"метай в /go@{reply_to} пора показать кто тут главный, а не прятаться!",
+                    f"метай в /go@{reply_to} не держи в себе, выплесни всю злость!",
+                    f"метай в /go@{reply_to} проведи воспитательную работу, если хватит смелости!",
+                    f"метай в /go@{reply_to} твоя очередь сиять, или ты предпочитаешь молчать?",
+                    f"метай в /go@{reply_to} джентльмены не промахиваются, а ты кто?",
+                    f"метай в /go@{reply_to} возьми перчатку… и кинь обратно, если не струсишь!",
+                    f"метай в /go@{reply_to} покажи что ты не просто болтун!",
+                    f"метай в /go@{reply_to} докажи что у тебя есть яйца!",
+                    f"метай в /go@{reply_to} не будь тряпкой, ответь как мужчина!",
+                    f"метай в /go@{reply_to} ты же не будешь терпеть такое унижение?",
+                    f"метай в /go@{reply_to} покажи что ты не просто пустозвон!",
+                    f"метай в /go@{reply_to} докажи что ты не трус и не подкаблучник!",
+                    f"метай в /go@{reply_to} не прячься за спинами, ответь!",
+                    f"метай в /go@{reply_to} ты же не будешь молчать как рыба?",
+                    f"метай в /go@{reply_to} покажи что у тебя есть характер!",
+                    f"метай в /go@{reply_to} докажи что ты не просто болтун и хвастун!",
+                ]
+                
+                # Пул всратых фраз вместо "может ответить!"
+                response_phrases = [
+                    "готов к ответке?",
+                    "может дать сдачи?",
+                    "готов к реваншу?",
+                    "может отомстить?",
+                    "готов к контратаке?",
+                    "может дать по рогам?",
+                    "готов к дуэли?",
+                    "может показать кузькину мать?",
+                    "готов к разборкам?",
+                    "может дать по шапке?",
+                    "готов к выяснению отношений?",
+                    "может показать кто тут главный?",
+                    "готов к разбору полетов?",
+                    "может дать по мозгам?",
+                    "готов к выяснению кто прав?",
+                    "может показать мастер-класс?",
+                    "готов к уроку вежливости?",
+                    "может дать по зубам?",
+                    "готов к воспитательному процессу?",
+                    "может показать как надо?",
+                ]
+                # Фразы про фокус
+                if stacks > 2:
+                    signals['focus_warning'] = True
+                    signals['callouts'].append(
+                        f"@{target['username']} под прицелом! Фокус: {stacks}"
+                    )
+                # Heat callouts (порог 20)
+                heat = signals['heat_status']
+                if isinstance(heat, int) and heat >= 20:
+                    heat_pool = [
+                        f"Агрессор перегрелся ({heat}/100). Остуди его: /go@{reply_to}",
+                        f"Воняет от смелости ({heat}/100). Пора умыть: /go@{reply_to}",
+                    ]
+                    signals['callouts'].append(random.choice(heat_pool))
+                # Основной призыв — случайная ответка
+                retaliate_phrase = random.choice(retaliate_pool)
+                response_phrase = random.choice(response_phrases)
+                # Добавляем информацию о том, кто на кого нападал
+                signals['callouts'].append(f"💥 @{signals.get('initiator_username', 'initiator')} атаковал @{target['username']}")
+                signals['call_to_action'] = f"🎯 @{target['username']} {response_phrase} {retaliate_phrase}"
         
         return signals
     

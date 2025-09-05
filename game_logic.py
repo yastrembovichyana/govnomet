@@ -18,7 +18,8 @@ class GameLogic:
         self.weights = list(OUTCOME_PROBABILITIES.values())
         self.combo_counters = {}  # Счетчики комбо для каждого пользователя
         self.streak_counters = {}  # Счетчики серий для каждого пользователя
-        # Новые поля для расширенной механики
+        # Новые поля для 
+        # ширенной механики
         self.user_roles = {}  # user_id -> (role, expires_at)
         self.user_heat = {}   # user_id -> heat (0-100)
         self.user_scores = {} # user_id -> score
@@ -28,6 +29,102 @@ class GameLogic:
         self.user_debuffs: dict[int, dict] = {}  # саботажник вешает дебафф
         logger.info("🎮 Игровая логика ГовноМёт инициализирована")
     
+    # ---------------------- Точность и промахи (русская логика) ----------------------
+    def _clamp(self, value: float, min_v: float, max_v: float) -> float:
+        """Ограничение значения в заданных пределах."""
+        return max(min_v, min(max_v, value))
+
+    def compute_hit_chance(self,
+                           *,
+                           is_targeted: bool,
+                           initiator_id: int,
+                           target_id: int | None,
+                           chat_id: int) -> float:
+        """Рассчитать шанс прямого попадания с учётом роли, фокуса и жара.
+
+        Возвращает вероятность в диапазоне [0.05, 0.95].
+        """
+        # База
+        accuracy = 0.55 if is_targeted else 0.45
+
+        # Фокус (бонус метателю за накапливание прицела на цели)
+        if target_id is not None:
+            stacks = self.focus_stacks.get((initiator_id, target_id, chat_id), 0)
+            focus_bonus = min(stacks, 3) * 0.08  # до +24%
+            accuracy += focus_bonus
+        else:
+            stacks = 0
+
+        # Жар метателя
+        heat = self.user_heat.get(initiator_id, 0)
+        heat_penalty = min(int(heat / 5) / 100.0, 0.20)  # до -20%
+        accuracy -= heat_penalty
+        if heat >= 80:
+            accuracy -= 0.10  # жёсткий оверхит
+
+        # Роль метателя
+        role = self.get_user_role(initiator_id)
+        if role == 'sniper':
+            accuracy += 0.15
+            if heat >= 60:
+                accuracy -= 0.15
+        elif role == 'bombardier':
+            accuracy -= 0.05
+        elif role == 'drunk_sniper':
+            accuracy += 0.20 if heat < 30 else -0.20
+        elif role == 'berserker':
+            accuracy += 0.10
+        elif role == 'trickster':
+            pass
+        elif role == 'magnet':
+            if stacks >= 2:
+                accuracy += 0.12
+        elif role == 'oracle':
+            accuracy += 0.08
+        elif role == 'pyromaniac':
+            if heat >= 20:
+                accuracy += 0.10
+            if heat >= 80:
+                accuracy -= 0.10
+        elif role == 'rocketeer':
+            accuracy -= 0.08
+        elif role == 'snot_sniper':
+            accuracy += 0.12
+        elif role == 'acid_clown':
+            accuracy -= 0.10
+        # counter_guru, collector, teleporter и пр. — отдельно по эффектам ниже
+
+        # Роль цели (усложняем жизнь метателю)
+        if target_id is not None:
+            target_role = self.get_user_role(target_id)
+            if target_role == 'defender':
+                accuracy -= 0.10
+            elif target_role == 'shieldbearer':
+                accuracy -= 0.08
+
+        # Ограничения
+        accuracy = self._clamp(accuracy, 0.05, 0.95)
+        logger.debug(f"🎯 Шанс попадания: {accuracy:.2%} (role={role}, heat={heat}, stacks={stacks})")
+        return accuracy
+
+    def _pick_miss_text(self, target_username: str, role: str | None) -> str:
+        """Русские фразы промаха по конкретной цели, с учётом роли."""
+        common = [
+            f"😬 Промах по @{target_username}. Говно шмякнулось мимо.",
+            f"💨 Не долетело до @{target_username}. Пыль столбом, толку — ноль.",
+            f"🤏 Чуть‑чуть не хватило до @{target_username}.",
+        ]
+        role_text = None
+        if role == 'drunk_sniper':
+            role_text = f"🥴 Шатнуло прицел — мимо @{target_username}."
+        elif role == 'rocketeer':
+            role_text = f"🚀 Ракета ушла в молоко — промах по @{target_username}."
+        elif role == 'bombardier':
+            role_text = f"💣 Кривой залп — мимо @{target_username}. Осколки разлетелись."
+        elif role == 'snot_sniper':
+            role_text = f"🤧 Сопля размазалась по ветру — мимо @{target_username}."
+        return role_text or random.choice(common)
+
     # ---------------------- Новая механика: роли и модификаторы ----------------------
     def assign_random_role(self, user_id: int) -> str:
         """Назначает случайную роль пользователю на 1 час"""
@@ -500,13 +597,14 @@ class GameLogic:
             }
     
     def process_throw_at_target(self, initiator_id: int, initiator_username: str,
-                               target_id: int, target_username: str, chat_id: int) -> Dict:
+                               target_id: int, target_username: str, chat_id: int,
+                               *, skip_cooldown: bool = False) -> Dict:
         """Обработка броска говна в конкретную цель"""
         try:
             logger.info(f"💩 Целевой бросок: {initiator_username} (ID: {initiator_id}) -> {target_username} (ID: {target_id}) в чате {chat_id}")
             
-            # Проверяем кулдаун
-            if self.check_cooldown(initiator_id):
+            # Проверяем кулдаун (можно пропустить для внутреннего редиректа)
+            if not skip_cooldown and self.check_cooldown(initiator_id):
                 return {
                     'outcome': 'cooldown',
                     'message': f"⏰ {initiator_username}, подожди ещё немного перед следующим броском!",
@@ -532,8 +630,9 @@ class GameLogic:
                 role = self.assign_random_role(initiator_id)
                 logger.info(f"🎭 Пользователю {initiator_username} назначена роль: {role}")
             
-            # Обновляем время последнего броска
-            self.record_throw(initiator_id)
+            # Обновляем время последнего броска (не пишем при внутреннем редиректе)
+            if not skip_cooldown:
+                self.record_throw(initiator_id)
             
             # Обновляем фокус на цель
             self.update_focus_stacks(initiator_id, target_id, chat_id)
@@ -541,22 +640,12 @@ class GameLogic:
             # Применяем штраф за фокус
             focus_penalty = self.calculate_focus_penalty(initiator_id, target_id, chat_id)
             
-            # Для целевого броска используем специальную логику
-            # Увеличиваем шанс прямого попадания, но оставляем возможность промаха
-            outcomes = ['direct_hit', 'miss', 'splash', 'special']
-            weights = [60, 15, 20, 5]  # Базовые веса
-            
-            # Применяем штраф за фокус
-            if focus_penalty > 1.0:
-                # Увеличиваем шанс промаха и особых эффектов
-                weights[1] = int(weights[1] * focus_penalty)  # miss
-                weights[3] = int(weights[3] * focus_penalty)  # special
-                # Нормализуем
-                total = sum(weights)
-                weights = [int(w * 100 / total) for w in weights]
-                logger.debug(f"🎯 Применён штраф за фокус: {focus_penalty:.2f}x")
-            
-            # Ролевые модификаторы к исходу
+            # Рассчитываем шанс прямого попадания (новая логика точности)
+            hit_chance = self.compute_hit_chance(is_targeted=True,
+                                                 initiator_id=initiator_id,
+                                                 target_id=target_id,
+                                                 chat_id=chat_id)
+            roll = random.random()
             role_now = self.get_user_role(initiator_id)
             if role_now == 'saboteur':
                 # Вешаем на цель дебафф промаха +30% на один ход
@@ -564,17 +653,29 @@ class GameLogic:
                     'miss_bonus': 0.3,
                     'expires_at': datetime.now() + timedelta(seconds=ROLE_DURATION/6)
                 }
-            if role_now == 'teleporter' and random.random() < 0.15:
-                # Перекидываем цель на случайного другого
-                avail = [('dummy', 'dummy')]
-                # фактически перекидывание реализуем как special brick по новой цели
-                outcomes = ['special']
-                weights = [100]
-            if role_now == 'trickster' and random.random() < 0.1:
-                # 10% шанс бумеранга
-                outcomes = ['special']
-                weights = [100]
-            outcome = random.choices(outcomes, weights=weights, k=1)[0]
+
+            # Спец-эффекты до применения исхода
+            forced_special = False
+            special_effect = None
+            if role_now == 'teleporter' and random.random() < 0.08:
+                forced_special = True
+                special_effect = 'brick'
+            elif role_now == 'trickster' and random.random() < 0.10:
+                forced_special = True
+                special_effect = 'boomerang'
+
+            # Определяем исход на основе шанса попадания
+            if not forced_special:
+                if roll < hit_chance:
+                    outcome = 'direct_hit'
+                else:
+                    # Промах может конвертироваться в splash у некоторых ролей
+                    if role_now in ('bombardier', 'rocketeer') and random.random() < 0.20:
+                        outcome = 'splash'
+                    else:
+                        outcome = 'miss'
+            else:
+                outcome = 'special'
             
             # Обновляем счетчики комбо и серий
             combo_count = self.update_combo_counter(initiator_id, outcome)
@@ -602,7 +703,8 @@ class GameLogic:
             
             elif outcome == 'miss':
                 targets = [(initiator_id, initiator_username)]
-                message = self.get_random_message(outcome, initiator=initiator_username)
+                # Русское явное сообщение о промахе по цели
+                message = self._pick_miss_text(target_username, role_now)
             
             elif outcome == 'splash':
                 # Разлетелось - цель + случайные дополнительные
@@ -615,7 +717,7 @@ class GameLogic:
             
             elif outcome == 'special':
                 # Особые эффекты для целевого броска
-                effect_type = random.choice(['boomerang', 'avalanche', 'brick', 'bomb'])
+                effect_type = special_effect or random.choice(['boomerang', 'avalanche', 'brick', 'bomb'])
                 logger.debug(f"⚡ Особый эффект для целевого броска: {effect_type}")
                 
                 if effect_type == 'boomerang':
@@ -657,6 +759,10 @@ class GameLogic:
                 'score_delta': score_delta,
                 'public_signals': self.generate_public_signals(initiator_id, targets, chat_id, current_role, initiator_username)
             }
+
+            # Флаг для последующего редиректа на случайную цель при промахе
+            if outcome == 'miss':
+                result['redirect_random'] = True
             
             logger.info(f"✅ Целевой бросок обработан: {outcome} -> {target_username}")
             logger.debug(f"📊 Результат: {result}")
@@ -687,21 +793,25 @@ class GameLogic:
             'callouts': []
         }
         
-        # Определяем кандидатов "под прицелом"
-        if targets and len(targets) == 1:
-            target_id = targets[0][0]
-            if target_id != initiator_id:
-                # Цель может ответить
-                signals['under_fire_candidates'].append({
-                    'user_id': target_id,
-                    'username': targets[0][1],
-                    'can_retaliate': True,
-                    'focus_stacks': self.focus_stacks.get((initiator_id, target_id, chat_id), 0)
-                })
-                
-                # Предупреждение о фокусе
-                if signals['under_fire_candidates'][0]['focus_stacks'] > 2:
-                    signals['focus_warning'] = True
+        # Определяем кандидата "под прицелом" всегда: 
+        # - если есть жертвы, берём первую НЕ инициатора; 
+        # - если только сам метатель пострадал (miss), делаем его кандидатом (позвать на реванш);
+        picked = None
+        if targets:
+            # Найдём первую жертву, отличную от инициатора
+            non_self = [t for t in targets if t[0] != initiator_id]
+            chosen = non_self[0] if non_self else targets[0]
+            target_id = chosen[0]
+            signals['under_fire_candidates'].append({
+                'user_id': target_id,
+                'username': chosen[1],
+                'can_retaliate': True,
+                'focus_stacks': self.focus_stacks.get((initiator_id, target_id, chat_id), 0)
+            })
+            picked = signals['under_fire_candidates'][0]
+            # Предупреждение о фокусе
+            if picked['focus_stacks'] > 2:
+                signals['focus_warning'] = True
         
         # Формируем призыв к действию
         if signals['under_fire_candidates']:

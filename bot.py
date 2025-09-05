@@ -201,6 +201,28 @@ async def cmd_go(message: types.Message):
             chat_id=chat_id
         )
 
+        # Если промах с редиректом на случайную цель — конвертируем результат
+        if game_result.get('outcome') == 'miss' and game_result.get('redirect_random'):
+            participants = await get_chat_participants(chat_id)
+            available_targets = [p for p in participants if p[0] != user.id]
+            if available_targets:
+                rnd_id, rnd_username = random.choice(available_targets)
+                reroll = game_logic.process_throw_at_target(
+                    initiator_id=user.id,
+                    initiator_username=user.username or f"user{user.id}",
+                    target_id=rnd_id,
+                    target_username=rnd_username,
+                    chat_id=chat_id,
+                    skip_cooldown=True
+                )
+                # Если второй бросок попал на кулдаун — показываем чистый кулдаун без текста промаха
+                if isinstance(reroll, dict) and reroll.get('error') == 'cooldown':
+                    game_result = reroll
+                else:
+                    # Объединяем сообщения: сначала промах по цели, затем результат по рандому
+                    merged_message = f"{game_result['message']}\n{reroll['message']}"
+                    game_result = {**reroll, 'message': merged_message}
+
         # Если кулдаун — показываем сообщение
         if isinstance(game_result, dict) and game_result.get('error') == 'cooldown':
             cooldown_msg = await message.answer(
@@ -261,7 +283,8 @@ async def cmd_go(message: types.Message):
         return
 
     # Если аргумент не указан — метаем случайно (как кнопкой)
-    if not message.text or len(message.text.split()) < 2:
+    # Важно: не уходим в случайный бросок для формата /go@user
+    if (not message.text or len(message.text.split()) < 2) and not (message.text and message.text.startswith('/go@')):
         # Добавляем пользователя в базу
         await db.add_user(
             user_id=user.id,
@@ -548,6 +571,42 @@ async def cmd_go(message: types.Message):
         target_username=target_user[1],
         chat_id=chat_id
     )
+    # Редирект при промахе и защита от накладок с кулдауном
+    if game_result.get('outcome') == 'miss' and game_result.get('redirect_random'):
+        participants = await get_chat_participants(chat_id)
+        available_targets = [p for p in participants if p[0] != user.id]
+        if available_targets:
+            rnd_id, rnd_username = random.choice(available_targets)
+            reroll = game_logic.process_throw_at_target(
+                initiator_id=user.id,
+                initiator_username=user.username or f"user{user.id}",
+                target_id=rnd_id,
+                target_username=rnd_username,
+                chat_id=chat_id,
+                skip_cooldown=True
+            )
+            if isinstance(reroll, dict) and reroll.get('error') == 'cooldown':
+                return await message.answer(
+                    f"⏰ {reroll['message']}",
+                    reply_markup=get_throw_button()
+                )
+            merged_message = f"{game_result['message']}\n{reroll['message']}"
+            game_result = {**reroll, 'message': merged_message}
+    # Редирект при промахе: сразу метаем в случайного и склеиваем сообщения
+    if game_result.get('outcome') == 'miss' and game_result.get('redirect_random'):
+        participants = await get_chat_participants(chat_id)
+        available_targets = [p for p in participants if p[0] != user.id]
+        if available_targets:
+            rnd_id, rnd_username = random.choice(available_targets)
+            reroll = game_logic.process_throw_at_target(
+                initiator_id=user.id,
+                initiator_username=user.username or f"user{user.id}",
+                target_id=rnd_id,
+                target_username=rnd_username,
+                chat_id=chat_id
+            )
+            merged_message = f"{game_result['message']}\n{reroll['message']}"
+            game_result = {**reroll, 'message': merged_message}
     
     # Если кулдаун — показываем сообщение и удаляем через 5 сек
     if isinstance(game_result, dict) and game_result.get('error') == 'cooldown':

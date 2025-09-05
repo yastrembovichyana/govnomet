@@ -28,6 +28,142 @@ dp = Dispatcher()
 db = Database()
 game_logic = GameLogic()
 
+# Кэш участников чатов (в реальности лучше получать через Telegram API)
+chat_participants_cache = {}
+"""Кэш участников на основе API/БД с тайм-слотом ~10 минут"""
+
+# Резервный сбор участников для basic-групп: по сообщениям и событиям
+chat_seen_users: dict[int, dict[int, str]] = {}
+"""chat_id -> { user_id: display_name }"""
+
+def _display_name_from_user(user: types.User) -> str:
+    """Возвращает идентификатор для упоминаний: только username или user{id}."""
+    return user.username or f"user{user.id}"
+
+def _record_seen_user(chat_id: int, user: types.User) -> None:
+    if chat_id not in chat_seen_users:
+        chat_seen_users[chat_id] = {}
+    chat_seen_users[chat_id][user.id] = _display_name_from_user(user)
+
+def _virtual_user_id_from_username(username: str) -> int:
+    """Генерирует стабильный виртуальный user_id по username (отрицательный ID)."""
+    import hashlib
+    base = int(hashlib.md5(username.encode('utf-8')).hexdigest()[:8], 16)
+    return -abs(base)
+
+def get_throw_button() -> InlineKeyboardMarkup:
+    """Создание кнопки для броска говна"""
+    builder = InlineKeyboardBuilder()
+    builder.add(InlineKeyboardButton(text="💩 Метнуть говна", callback_data="throw_shit"))
+    return builder.as_markup()
+
+def get_throw_button_with_role(role_used: str = None) -> InlineKeyboardMarkup:
+    """Создание кнопки для броска говна с кнопкой описания роли"""
+    builder = InlineKeyboardBuilder()
+    
+    if role_used:
+        builder.add(InlineKeyboardButton(text="🎭 Описание роли", callback_data=f"role_info:{role_used}"))
+    
+    builder.add(InlineKeyboardButton(text="💩 Метнуть говна", callback_data="throw_shit"))
+    
+    return builder.as_markup()
+
+def _format_public_signals(signals: dict) -> list[str]:
+    messages: list[str] = []
+    try:
+        # Добавляем все callouts (включая фразы про фокус и heat)
+        for line in signals.get('callouts', []):
+            messages.append(line.replace('/go @', '/go@'))
+        
+        # Добавляем call_to_action (основной призыв к действию)
+        if signals.get('call_to_action'):
+            messages.append(signals['call_to_action'].replace('/go @', '/go@'))
+            
+    except Exception:
+        pass
+    return messages
+
+async def _auto_delete(msg: types.Message, delay: int = 5):
+    try:
+        await asyncio.sleep(delay)
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+def schedule_auto_delete(msg: types.Message, delay: int = 5):
+    try:
+        asyncio.create_task(_auto_delete(msg, delay))
+    except Exception:
+        pass
+
+async def get_chat_participants(chat_id: int) -> List[Tuple[int, str]]:
+    """Получение участников чата через Telegram API"""
+    try:
+        # Используем кэш для оптимизации (обновляем каждые 5 минут)
+        cache_key = f"{chat_id}_{datetime.now().strftime('%Y%m%d_%H%M')[:-1]}"  # Округляем до 10 минут
+        
+        if cache_key not in chat_participants_cache:
+            try:
+                # Получаем реальных участников чата через Telegram API
+                chat_member_count = await bot.get_chat_member_count(chat_id)
+                logger.info(f"👥 В чате {chat_id} всего участников: {chat_member_count}")
+                
+                # Получаем список участников (максимум 200 для оптимизации)
+                participants = []
+                # В Bot API нет полноценного метода перечисления всех членов basic-группы.
+                # Если провалимся — используем fallback ниже.
+                async for member in bot.get_chat_members(chat_id, limit=200):  # может бросить исключение в basic-группах
+                    if not member.user.is_bot:
+                        username = member.user.username or f"user{member.user.id}"
+                        participants.append((member.user.id, username))
+                
+                chat_participants_cache[cache_key] = participants
+                logger.info(f"✅ Получено {len(participants)} участников чата {chat_id} через API")
+                
+            except Exception as api_error:
+                logger.warning(f"⚠️ Не удалось получить участников через API: {api_error}")
+                # Fallback: используем базу данных
+                participants = await db.get_chat_participants(chat_id)
+                # Если и в БД пусто (новый чат), используем собранных по сообщениям
+                if not participants:
+                    seen = chat_seen_users.get(chat_id, {})
+                    participants = [(uid, name) for uid, name in seen.items()]
+                    if participants:
+                        logger.info(f"🧩 Используем участников, собранных по сообщениям: {len(participants)}")
+                chat_participants_cache[cache_key] = participants
+                logger.info(f"📊 Используем данные из БД/seen: {len(participants)} участников")
+        
+        participants = chat_participants_cache[cache_key]
+
+        # Если кэш пустой — попробуем собрать из seen/БД прямо сейчас
+        if not participants:
+            seen_now = chat_seen_users.get(chat_id, {})
+            if seen_now:
+                participants = [(uid, name) for uid, name in seen_now.items()]
+                chat_participants_cache[cache_key] = participants
+                logger.info(f"🧩 Обновили кэш участников из seen: {len(participants)}")
+            else:
+                # Последняя попытка — взять из БД
+                participants = await db.get_chat_participants(chat_id)
+                if participants:
+                    chat_participants_cache[cache_key] = participants
+                    logger.info(f"📦 Обновили кэш участников из БД: {len(participants)}")
+
+        # Проверяем, есть ли участники
+        if not participants:
+            logger.warning(f"⚠️ В чате {chat_id} нет участников для игры")
+            return []
+        
+        logger.info(f"👥 Используем {len(participants)} участников чата {chat_id}")
+        return participants
+    
+    except Exception as e:
+        logger.error(f"❌ Ошибка получения участников чата {chat_id}: {e}")
+        return []
+
 # Обработчик команды /go (должен быть первым!)
 @dp.message(Command("go"))
 async def cmd_go(message: types.Message):
@@ -519,6 +655,12 @@ async def cmd_go(message: types.Message):
     
     logger.info(f"✅ Целевой бросок завершен: {user.username} -> {target_user[1]} -> {game_result['outcome']}")
 
+# Дополнительный обработчик для команд с упоминанием бота
+@dp.message(F.text.regexp(r"^/go(?:@[A-Za-z0-9_]+)?(?:\s|$)"))
+async def cmd_go_alias(message: types.Message):
+    """Обработчик команды /go с упоминанием бота"""
+    return await cmd_go(message)
+
 # Общий обработчик сообщений (должен быть после команд!)
 @dp.message(F.text & ~F.text.startswith('/'))
 async def _collect_seen_users(message: types.Message):
@@ -529,141 +671,7 @@ async def _collect_seen_users(message: types.Message):
     except Exception:
         pass
 
-# Кэш участников чатов (в реальности лучше получать через Telegram API)
-chat_participants_cache = {}
-"""Кэш участников на основе API/БД с тайм-слотом ~10 минут"""
 
-# Резервный сбор участников для basic-групп: по сообщениям и событиям
-chat_seen_users: dict[int, dict[int, str]] = {}
-"""chat_id -> { user_id: display_name }"""
-
-def _display_name_from_user(user: types.User) -> str:
-    """Возвращает идентификатор для упоминаний: только username или user{id}."""
-    return user.username or f"user{user.id}"
-
-def _record_seen_user(chat_id: int, user: types.User) -> None:
-    if chat_id not in chat_seen_users:
-        chat_seen_users[chat_id] = {}
-    chat_seen_users[chat_id][user.id] = _display_name_from_user(user)
-
-def _virtual_user_id_from_username(username: str) -> int:
-    """Генерирует стабильный виртуальный user_id по username (отрицательный ID)."""
-    import hashlib
-    base = int(hashlib.md5(username.encode('utf-8')).hexdigest()[:8], 16)
-    return -abs(base)
-
-def get_throw_button() -> InlineKeyboardMarkup:
-    """Создание кнопки для броска говна"""
-    builder = InlineKeyboardBuilder()
-    builder.add(InlineKeyboardButton(text="💩 Метнуть говна", callback_data="throw_shit"))
-    return builder.as_markup()
-
-def get_throw_button_with_role(role_used: str = None) -> InlineKeyboardMarkup:
-    """Создание кнопки для броска говна с кнопкой описания роли"""
-    builder = InlineKeyboardBuilder()
-    
-    if role_used:
-        builder.add(InlineKeyboardButton(text="🎭 Описание роли", callback_data=f"role_info:{role_used}"))
-    
-    builder.add(InlineKeyboardButton(text="💩 Метнуть говна", callback_data="throw_shit"))
-    
-    return builder.as_markup()
-
-def _format_public_signals(signals: dict) -> list[str]:
-    messages: list[str] = []
-    try:
-        # Добавляем все callouts (включая фразы про фокус и heat)
-        for line in signals.get('callouts', []):
-            messages.append(line.replace('/go @', '/go@'))
-        
-        # Добавляем call_to_action (основной призыв к действию)
-        if signals.get('call_to_action'):
-            messages.append(signals['call_to_action'].replace('/go @', '/go@'))
-            
-    except Exception:
-        pass
-    return messages
-
-async def _auto_delete(msg: types.Message, delay: int = 5):
-    try:
-        await asyncio.sleep(delay)
-        try:
-            await msg.delete()
-        except Exception:
-            pass
-    except Exception:
-        pass
-
-def schedule_auto_delete(msg: types.Message, delay: int = 5):
-    try:
-        asyncio.create_task(_auto_delete(msg, delay))
-    except Exception:
-        pass
-
-async def get_chat_participants(chat_id: int) -> List[Tuple[int, str]]:
-    """Получение участников чата через Telegram API"""
-    try:
-        # Используем кэш для оптимизации (обновляем каждые 5 минут)
-        cache_key = f"{chat_id}_{datetime.now().strftime('%Y%m%d_%H%M')[:-1]}"  # Округляем до 10 минут
-        
-        if cache_key not in chat_participants_cache:
-            try:
-                # Получаем реальных участников чата через Telegram API
-                chat_member_count = await bot.get_chat_member_count(chat_id)
-                logger.info(f"👥 В чате {chat_id} всего участников: {chat_member_count}")
-                
-                # Получаем список участников (максимум 200 для оптимизации)
-                participants = []
-                # В Bot API нет полноценного метода перечисления всех членов basic-группы.
-                # Если провалимся — используем fallback ниже.
-                async for member in bot.get_chat_members(chat_id, limit=200):  # может бросить исключение в basic-группах
-                    if not member.user.is_bot:
-                        username = member.user.username or f"user{member.user.id}"
-                        participants.append((member.user.id, username))
-                
-                chat_participants_cache[cache_key] = participants
-                logger.info(f"✅ Получено {len(participants)} участников чата {chat_id} через API")
-                
-            except Exception as api_error:
-                logger.warning(f"⚠️ Не удалось получить участников через API: {api_error}")
-                # Fallback: используем базу данных
-                participants = await db.get_chat_participants(chat_id)
-                # Если и в БД пусто (новый чат), используем собранных по сообщениям
-                if not participants:
-                    seen = chat_seen_users.get(chat_id, {})
-                    participants = [(uid, name) for uid, name in seen.items()]
-                    if participants:
-                        logger.info(f"🧩 Используем участников, собранных по сообщениям: {len(participants)}")
-                chat_participants_cache[cache_key] = participants
-                logger.info(f"📊 Используем данные из БД/seen: {len(participants)} участников")
-        
-        participants = chat_participants_cache[cache_key]
-
-        # Если кэш пустой — попробуем собрать из seen/БД прямо сейчас
-        if not participants:
-            seen_now = chat_seen_users.get(chat_id, {})
-            if seen_now:
-                participants = [(uid, name) for uid, name in seen_now.items()]
-                chat_participants_cache[cache_key] = participants
-                logger.info(f"🧩 Обновили кэш участников из seen: {len(participants)}")
-            else:
-                # Последняя попытка — взять из БД
-                participants = await db.get_chat_participants(chat_id)
-                if participants:
-                    chat_participants_cache[cache_key] = participants
-                    logger.info(f"📦 Обновили кэш участников из БД: {len(participants)}")
-
-        # Проверяем, есть ли участники
-        if not participants:
-            logger.warning(f"⚠️ В чате {chat_id} нет участников для игры")
-            return []
-        
-        logger.info(f"👥 Используем {len(participants)} участников чата {chat_id}")
-        return participants
-    
-    except Exception as e:
-        logger.error(f"❌ Ошибка получения участников чата {chat_id}: {e}")
-        return []
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):

@@ -23,6 +23,503 @@ logger = setup_logging(
 # Инициализация бота
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
+
+# Инициализация компонентов
+db = Database()
+game_logic = GameLogic()
+
+# Обработчик команды /go (должен быть первым!)
+@dp.message(Command("go"))
+async def cmd_go(message: types.Message):
+    """Метнуть говно в конкретного пользователя"""
+    schedule_auto_delete(message, 10)
+    user = message.from_user
+    chat_id = message.chat.id
+    
+    logger.info(f"💩 Команда /go от пользователя {user.username} (ID: {user.id}) в чате {chat_id}")
+    
+    # Регистрируем автора
+    _record_seen_user(chat_id, user)
+
+    # Если аргумент не указан, но это ответ на сообщение — целимся в автора реплая
+    if (not message.text or len(message.text.split()) < 2) and getattr(message, "reply_to_message", None):
+        # Добавляем пользователя в базу
+        await db.add_user(
+            user_id=user.id,
+            username=user.username,
+            first_name=user.first_name,
+            last_name=user.last_name
+        )
+
+        participants = await get_chat_participants(chat_id)
+        reply_user = message.reply_to_message.from_user
+        target_id = reply_user.id
+        target_username = reply_user.username or f"user{reply_user.id}"
+
+        # Если цели нет в списке, всё равно бьём по реплаю
+        game_result = game_logic.process_throw_at_target(
+            initiator_id=user.id,
+            initiator_username=user.username or f"user{user.id}",
+            target_id=target_id,
+            target_username=target_username,
+            chat_id=chat_id
+        )
+
+        # Если кулдаун — показываем сообщение
+        if isinstance(game_result, dict) and game_result.get('error') == 'cooldown':
+            cooldown_msg = await message.answer(
+                f"⏰ {game_result['message']}",
+                reply_markup=get_throw_button()
+            )
+            schedule_auto_delete(cooldown_msg, 5)
+            try:
+                hint_msg = await message.answer("⏰ Подожди немного…")
+                schedule_auto_delete(hint_msg, 5)
+            except Exception:
+                pass
+            return
+
+        for target in game_result['targets']:
+            await db.add_event(
+                initiator_id=user.id,
+                target_id=target[0],
+                outcome=game_result['outcome'],
+                chat_id=chat_id
+            )
+        await db.update_user_stats(user.id, game_result['outcome'], is_target=False)
+        for target in game_result['targets']:
+            await db.update_user_stats(target[0], game_result['outcome'], is_target=True)
+        emoji = game_logic.get_emoji_for_outcome(game_result['outcome'])
+        result_message = f"{emoji} {game_result['message']}"
+        # Добавляем роль к результату
+        if game_result.get('role_used'):
+            role_names = {
+                'sniper': '🎯 Снайпер',
+                'bombardier': '💣 Бомбардир',
+                'defender': '🛡️ Оборонец',
+                'drunk_sniper': '🍺🎯 Снайпер‑пьяница',
+                'berserker': '🪓 Берсерк',
+                'trickster': '🃏 Трикстер',
+                'magnet': '🧲 Магнит',
+                'saboteur': '🕳️ Саботажник',
+                'oracle': '🔮 Оракул',
+                'pyromaniac': '🔥 Пироман',
+                'shieldbearer': '🛡️ Щитоносец',
+                'collector': '📎 Коллектор',
+                'teleporter': '🌀 Телепортер',
+                'rocketeer': '🚀 Говноракетчик',
+                'snot_sniper': '🤧 Сопля‑снайпер',
+                'acid_clown': '🧪🤡 Кислотный клоун',
+                'counter_guru': '🔁 Обратка‑гуру'
+            }
+            role_name = role_names.get(game_result['role_used'], '🎭 Неизвестная роль')
+            result_message += f"\n\n🎭 Роль метателя: {role_name}"
+
+        # Добавляем публичные сигналы в то же сообщение
+        if game_result.get('public_signals'):
+            extras = _format_public_signals(game_result['public_signals'])
+            if extras:
+                result_message += "\n\n" + "\n".join([f"📢 {line}" for line in extras])
+
+        await message.answer(result_message, reply_markup=get_throw_button_with_role(game_result.get('role_used')))
+        return
+
+    # Если аргумент не указан — метаем случайно (как кнопкой)
+    if not message.text or len(message.text.split()) < 2:
+        # Добавляем пользователя в базу
+        await db.add_user(
+            user_id=user.id,
+            username=user.username,
+            first_name=user.first_name,
+            last_name=user.last_name
+        )
+        
+        # Получаем участников чата
+        participants = await get_chat_participants(chat_id)
+        if not participants:
+            # Фоллбэк: берём хотя бы инициатора, чтобы бросок всегда сработал
+            initiator_name = user.username or f"user{user.id}"
+            participants = [(user.id, initiator_name)]
+            logger.info("🧩 Нет участников — используем инициатора как единственную цель для случайного броска")
+
+        # Пытаемся выбрать рандомную цель (не инициатора). Если никого, оставим текущую механику
+        available_targets = [p for p in participants if p[0] != user.id]
+        if available_targets:
+            random_target_id, random_target_username = random.choice(available_targets)
+            logger.info(f"🎯 /go без аргумента: выбран случайный таргет @{random_target_username} ({random_target_id})")
+            game_result = game_logic.process_throw_at_target(
+                initiator_id=user.id,
+                initiator_username=user.username or f"user{user.id}",
+                target_id=random_target_id,
+                target_username=random_target_username,
+                chat_id=chat_id
+            )
+        else:
+            # Обрабатываем случайный бросок по старой логике (когда один в чате)
+            game_result = game_logic.process_throw(
+                initiator_id=user.id,
+                initiator_username=user.username or f"user{user.id}",
+                participants=participants,
+                chat_id=chat_id
+            )
+        
+        # Если кулдаун — показываем сообщение
+        if isinstance(game_result, dict) and game_result.get('error') == 'cooldown':
+            cooldown_msg = await message.answer(
+                f"⏰ {game_result['message']}",
+                reply_markup=get_throw_button()
+            )
+            schedule_auto_delete(cooldown_msg, 5)
+            try:
+                hint_msg = await message.answer("⏰ Подожди немного…")
+                schedule_auto_delete(hint_msg, 5)
+            except Exception:
+                pass
+            return
+        
+        # Сохраняем событие(я)
+        for target in game_result['targets']:
+            await db.add_event(
+                initiator_id=user.id,
+                target_id=target[0],
+                outcome=game_result['outcome'],
+                chat_id=chat_id
+            )
+        
+        # Обновляем статистику
+        await db.update_user_stats(user.id, game_result['outcome'], is_target=False)
+        for target in game_result['targets']:
+            await db.update_user_stats(target[0], game_result['outcome'], is_target=True)
+        
+        # Сообщение результата
+        emoji = game_logic.get_emoji_for_outcome(game_result['outcome'])
+        result_message = f"{emoji} {game_result['message']}"
+        # Добавляем роль к результату
+        if game_result.get('role_used'):
+            role_names = {
+                'sniper': '🎯 Снайпер',
+                'bombardier': '💣 Бомбардир',
+                'defender': '🛡️ Оборонец',
+                'drunk_sniper': '🍺🎯 Снайпер‑пьяница',
+                'berserker': '🪓 Берсерк',
+                'trickster': '🃏 Трикстер',
+                'magnet': '🧲 Магнит',
+                'saboteur': '🕳️ Саботажник',
+                'oracle': '🔮 Оракул',
+                'pyromaniac': '🔥 Пироман',
+                'shieldbearer': '🛡️ Щитоносец',
+                'collector': '📎 Коллектор',
+                'teleporter': '🌀 Телепортер',
+                'rocketeer': '🚀 Говноракетчик',
+                'snot_sniper': '🤧 Сопля‑снайпер',
+                'acid_clown': '🧪🤡 Кислотный клоун',
+                'counter_guru': '🔁 Обратка‑гуру'
+            }
+            role_name = role_names.get(game_result['role_used'], '🎭 Неизвестная роль')
+            result_message += f"\n\n🎭 Роль метателя: {role_name}"
+
+        # Публичные сигналы (в том же сообщении)
+        if game_result.get('public_signals'):
+            extras = _format_public_signals(game_result['public_signals'])
+            if extras:
+                result_message += "\n\n" + "\n".join([f"📢 {line}" for line in extras])
+        await message.answer(
+            result_message,
+            reply_markup=get_throw_button_with_role(game_result.get('role_used'))
+        )
+        return
+    
+    # Извлекаем цель из entities/текста
+    target_username = None
+    # 1) entities: mention (@name) или text_mention (прямой пользователь)
+    try:
+        if message.entities:
+            for ent in message.entities:
+                if ent.type in {"mention", "text_mention"}:
+                    if ent.type == "mention":
+                        target_username = message.text[ent.offset: ent.offset + ent.length]
+                        target_username = target_username.lstrip('@')
+                        break
+                    elif ent.type == "text_mention" and ent.user:
+                        target_username = str(ent.user.id)
+                        break
+    except Exception:
+        pass
+    # 2) если не нашли — поддержим формат без пробела: /go@user
+    if not target_username and message.text and message.text.startswith('/go@'):
+        after = message.text[len('/go@'):]
+        target_username = after.split()[0].strip(',.;:!?)(')
+    # 3) если не нашли — берём второй токен
+    if not target_username:
+        parts = message.text.split(maxsplit=1)
+        if len(parts) > 1:
+            target_username = parts[1].strip()
+    # Чистим от пунктуации по краям и @
+    if target_username:
+        target_username = target_username.strip().strip(',.;:!?)(').lstrip('@')
+    else:
+        # Если вообще ничего не удалось извлечь — fallback в случайный бросок
+        await message.answer("🤷 Не понял, в кого метать. Кидаю наугад.")
+        # Выполняем логику случайного броска напрямую
+        await db.add_user(
+            user_id=user.id,
+            username=user.username,
+            first_name=user.first_name,
+            last_name=user.last_name
+        )
+        participants = await get_chat_participants(chat_id)
+        if not participants:
+            initiator_name = user.username or f"user{user.id}"
+            participants = [(user.id, initiator_name)]
+        available_targets = [p for p in participants if p[0] != user.id]
+        if available_targets:
+            random_target_id, random_target_username = random.choice(available_targets)
+            game_result = game_logic.process_throw_at_target(
+                initiator_id=user.id,
+                initiator_username=user.username or f"user{user.id}",
+                target_id=random_target_id,
+                target_username=random_target_username,
+                chat_id=chat_id
+            )
+        else:
+            game_result = game_logic.process_throw(
+                initiator_id=user.id,
+                initiator_username=user.username or f"user{user.id}",
+                participants=participants,
+                chat_id=chat_id
+            )
+        if isinstance(game_result, dict) and game_result.get('error') == 'cooldown':
+            await message.answer(f"⏰ {game_result['message']}", reply_markup=get_throw_button())
+            try:
+                await message.answer("⏰ Подожди немного…")
+            except Exception:
+                pass
+            return
+        for target in game_result['targets']:
+            await db.add_event(
+                initiator_id=user.id,
+                target_id=target[0],
+                outcome=game_result['outcome'],
+                chat_id=chat_id
+            )
+        await db.update_user_stats(user.id, game_result['outcome'], is_target=False)
+        for target in game_result['targets']:
+            await db.update_user_stats(target[0], game_result['outcome'], is_target=True)
+        emoji = game_logic.get_emoji_for_outcome(game_result['outcome'])
+        result_message = f"{emoji} {game_result['message']}"
+        
+        # Добавляем роль к результату
+        if game_result.get('role_used'):
+            role_names = {
+                'sniper': '🎯 Снайпер',
+                'bombardier': '💣 Бомбардир',
+                'defender': '🛡️ Оборонец',
+                'drunk_sniper': '🍺🎯 Снайпер‑пьяница',
+                'berserker': '🪓 Берсерк',
+                'trickster': '🃏 Трикстер',
+                'magnet': '🧲 Магнит',
+                'saboteur': '🕳️ Саботажник',
+                'oracle': '🔮 Оракул',
+                'pyromaniac': '🔥 Пироман',
+                'shieldbearer': '🛡️ Щитоносец',
+                'collector': '📎 Коллектор',
+                'teleporter': '🌀 Телепортер',
+                'rocketeer': '🚀 Говноракетчик',
+                'snot_sniper': '🤧 Сопля‑снайпер',
+                'acid_clown': '🧪🤡 Кислотный клоун',
+                'counter_guru': '🔁 Обратка‑гуру'
+            }
+            role_name = role_names.get(game_result['role_used'], '🎭 Неизвестная роль')
+            result_message += f"\n\n🎭 Роль метателя: {role_name}"
+        
+        # Добавляем публичные сигналы в то же сообщение
+        if game_result.get('public_signals'):
+            extras = _format_public_signals(game_result['public_signals'])
+            if extras:
+                result_message += "\n\n" + "\n".join([f"📢 {line}" for line in extras])
+
+        await message.answer(result_message, reply_markup=get_throw_button_with_role(game_result.get('role_used')))
+        return
+    logger.info(f"🎯 Цель команды /go: @{target_username}")
+    
+    # Добавляем пользователя в базу
+    await db.add_user(
+        user_id=user.id,
+        username=user.username,
+        first_name=user.first_name,
+        last_name=user.last_name
+    )
+    
+    # Получаем участников чата
+    participants = await get_chat_participants(chat_id)
+    # Даже если участников нет, продолжаем: позволяем кидать в произвольный username (виртуальная цель)
+    
+    # Ищем цель по имени или username
+    target_user = None
+    # Сначала пробуем найти по ID, если аргумент — число
+    if target_username.isdigit():
+        numeric_id = int(target_username)
+        for user_id, display_name in participants:
+            if user_id == numeric_id:
+                target_user = (user_id, display_name or f"user{user_id}")
+                break
+    # Затем ищем по username/отображаемому имени (без учёта регистра)
+    if target_user is None:
+        for user_id, display_name in participants:
+            if not display_name:
+                continue
+            name_l = display_name.lower()
+            arg_l = target_username.lower()
+            if name_l == arg_l or name_l.startswith(arg_l):
+                target_user = (user_id, display_name)
+                break
+    
+    if not target_user:
+        # Разрешаем метнуть в любого username: создаём виртуального пользователя
+        virtual_id = _virtual_user_id_from_username(target_username.lower())
+        target_user = (virtual_id, target_username)
+        logger.info(f"🧩 Цель @{target_username} не найдена в участниках. Используем виртуальный ID {virtual_id}")
+        
+        # Сохраняем в seen и в БД (как пользователя без активности)
+        chat_seen_users.setdefault(chat_id, {})[virtual_id] = target_username
+        try:
+            await db.add_user(user_id=virtual_id, username=target_username)
+        except Exception:
+            pass
+    
+    # Проверяем, что цель не является самим метателем
+    if target_user[0] == user.id:
+        error_msg = await message.answer(
+            "🤡 Нельзя метать говно в самого себя! Попробуйте другую цель.",
+            reply_markup=get_throw_button()
+        )
+        
+        # Удаляем сообщение об ошибке через 5 секунд
+        await asyncio.sleep(5)
+        try:
+            await error_msg.delete()
+            logger.debug(f"🗑️ Сообщение об ошибке команды /go от {user.username} удалено")
+        except Exception as e:
+            logger.warning(f"⚠️ Не удалось удалить сообщение об ошибке от {user.username}: {e}")
+        
+        return
+    
+    # Обрабатываем бросок в конкретную цель
+    game_result = game_logic.process_throw_at_target(
+        initiator_id=user.id,
+        initiator_username=user.username or f"user{user.id}",
+        target_id=target_user[0],
+        target_username=target_user[1],
+        chat_id=chat_id
+    )
+    
+    # Если кулдаун — показываем сообщение и удаляем через 5 сек
+    if isinstance(game_result, dict) and game_result.get('error') == 'cooldown':
+        cooldown_msg = await message.answer(
+            f"⏰ {game_result['message']}",
+            reply_markup=get_throw_button()
+        )
+        await asyncio.sleep(5)
+        try:
+            await cooldown_msg.delete()
+        except Exception:
+            pass
+        return
+    
+    # Проверяем на ошибки (кулдаун, самоцель и т.д.)
+    if 'error' in game_result:
+        error_msg = await message.answer(
+            game_result['message'],
+            reply_markup=get_throw_button()
+        )
+        # Удаляем сообщение об ошибке через 5 секунд
+        await asyncio.sleep(5)
+        try:
+            await error_msg.delete()
+        except Exception:
+            pass
+        return
+    
+    # Обновляем расширенные данные пользователя в БД
+    await db.update_user_heat(user.id, game_result.get('heat_at_throw', 0))
+    await db.update_score(user.id, game_result.get('score_delta', 0))
+    if game_result.get('role_used'):
+        expires_at = datetime.now() + timedelta(seconds=3600)  # 1 час
+        await db.update_user_role(user.id, game_result['role_used'], expires_at.isoformat())
+    await db.update_user_last_throw(user.id)
+    
+    # Добавляем событие в базу с новыми полями
+    await db.add_event(
+        initiator_id=user.id,
+        target_id=target_user[0],
+        outcome=game_result['outcome'],
+        chat_id=chat_id,
+        role_used=game_result.get('role_used'),
+        stacks_at_hit=game_result.get('focus_stacks', 0),
+        heat_at_hit=game_result.get('heat_at_throw', 0),
+        was_reflect=0,  # TODO: реализовать отражение
+        targets_json=str(game_result['targets'])
+    )
+    
+    # Обновляем фокус в БД
+    focus_stacks = game_result.get('focus_stacks', 0)
+    penalty_until = None
+    if focus_stacks > 3:  # Штраф за фокус
+        penalty_until = (datetime.now() + timedelta(seconds=300)).isoformat()  # 5 минут
+    await db.set_focus(user.id, target_user[0], chat_id, focus_stacks, penalty_until)
+    
+    # Обновляем базовую статистику
+    await db.update_user_stats(user.id, game_result['outcome'], is_target=False)
+    await db.update_user_stats(target_user[0], game_result['outcome'], is_target=True)
+    
+    # Формируем сообщение с результатом
+    emoji = game_logic.get_emoji_for_outcome(game_result['outcome'])
+    result_message = f"{emoji} {game_result['message']}"
+    
+    # Добавляем информацию о роли и heat
+    if game_result.get('role_used'):
+        role_names = {
+            'sniper': '🎯 Снайпер',
+            'bombardier': '💣 Бомбардир', 
+            'defender': '🛡️ Оборонец',
+            'drunk_sniper': '🍺🎯 Снайпер‑пьяница',
+            'berserker': '🪓 Берсерк',
+            'trickster': '🃏 Трикстер',
+            'magnet': '🧲 Магнит',
+            'saboteur': '🕳️ Саботажник',
+            'oracle': '🔮 Оракул',
+            'pyromaniac': '🔥 Пироман',
+            'shieldbearer': '🛡️ Щитоносец',
+            'collector': '📎 Коллектор',
+            'teleporter': '🌀 Телепортер',
+            'rocketeer': '🚀 Говноракетчик',
+            'snot_sniper': '🤧 Сопля‑снайпер',
+            'acid_clown': '🧪🤡 Кислотный клоун',
+            'counter_guru': '🔁 Обратка‑гуру'
+        }
+        role_name = role_names.get(game_result['role_used'], '🎭 Неизвестная роль')
+        result_message += f"\n\n🎭 Роль метателя: {role_name}"
+    
+    if game_result.get('heat_at_throw', 0) > 50:
+        result_message += f"\n🔥 Репутация агрессора: {game_result['heat_at_throw']}/100"
+    
+    # Добавляем публичные сигналы в то же сообщение
+    if game_result.get('public_signals'):
+        extras = _format_public_signals(game_result['public_signals'])
+        if extras:
+            result_message += "\n\n" + "\n".join([f"📢 {line}" for line in extras])
+
+    # Отправляем результат
+    await message.answer(
+        result_message,
+        reply_markup=get_throw_button_with_role(game_result.get('role_used'))
+    )
+    
+    # Больше не удаляем сообщение команды /go
+    
+    logger.info(f"✅ Целевой бросок завершен: {user.username} -> {target_user[1]} -> {game_result['outcome']}")
+
+# Общий обработчик сообщений (должен быть после команд!)
 @dp.message(F.text & ~F.text.startswith('/'))
 async def _collect_seen_users(message: types.Message):
     """Тихий сбор авторов сообщений как участников (особенно для basic-групп)."""
@@ -31,10 +528,6 @@ async def _collect_seen_users(message: types.Message):
             _record_seen_user(message.chat.id, message.from_user)
     except Exception:
         pass
-
-# Инициализация компонентов
-db = Database()
-game_logic = GameLogic()
 
 # Кэш участников чатов (в реальности лучше получать через Telegram API)
 chat_participants_cache = {}
@@ -739,496 +1232,6 @@ async def cmd_participants(message: types.Message):
 @dp.message(F.text.regexp(r"^/participants(?:@[A-Za-z0-9_]+)?(?:\s|$)"))
 async def cmd_participants_alias(message: types.Message):
     return await cmd_participants(message)
-
-@dp.message(Command("go"))
-async def cmd_go(message: types.Message):
-    """Метнуть говно в конкретного пользователя"""
-    schedule_auto_delete(message, 10)
-    user = message.from_user
-    chat_id = message.chat.id
-    
-    logger.info(f"💩 Команда /go от пользователя {user.username} (ID: {user.id}) в чате {chat_id}")
-    
-    # Регистрируем автора
-    _record_seen_user(chat_id, user)
-
-    # Если аргумент не указан, но это ответ на сообщение — целимся в автора реплая
-    if (not message.text or len(message.text.split()) < 2) and getattr(message, "reply_to_message", None):
-        # Добавляем пользователя в базу
-        await db.add_user(
-            user_id=user.id,
-            username=user.username,
-            first_name=user.first_name,
-            last_name=user.last_name
-        )
-
-        participants = await get_chat_participants(chat_id)
-        reply_user = message.reply_to_message.from_user
-        target_id = reply_user.id
-        target_username = reply_user.username or f"user{reply_user.id}"
-
-        # Если цели нет в списке, всё равно бьём по реплаю
-        game_result = game_logic.process_throw_at_target(
-            initiator_id=user.id,
-            initiator_username=user.username or f"user{user.id}",
-            target_id=target_id,
-            target_username=target_username,
-            chat_id=chat_id
-        )
-
-        # Если кулдаун — показываем сообщение
-        if isinstance(game_result, dict) and game_result.get('error') == 'cooldown':
-            cooldown_msg = await message.answer(
-                f"⏰ {game_result['message']}",
-                reply_markup=get_throw_button()
-            )
-            schedule_auto_delete(cooldown_msg, 5)
-            try:
-                hint_msg = await message.answer("⏰ Подожди немного…")
-                schedule_auto_delete(hint_msg, 5)
-            except Exception:
-                pass
-            return
-
-        for target in game_result['targets']:
-            await db.add_event(
-                initiator_id=user.id,
-                target_id=target[0],
-                outcome=game_result['outcome'],
-                chat_id=chat_id
-            )
-        await db.update_user_stats(user.id, game_result['outcome'], is_target=False)
-        for target in game_result['targets']:
-            await db.update_user_stats(target[0], game_result['outcome'], is_target=True)
-        emoji = game_logic.get_emoji_for_outcome(game_result['outcome'])
-        result_message = f"{emoji} {game_result['message']}"
-        # Добавляем роль к результату
-        if game_result.get('role_used'):
-            role_names = {
-                'sniper': '🎯 Снайпер',
-                'bombardier': '💣 Бомбардир',
-                'defender': '🛡️ Оборонец',
-                'drunk_sniper': '🍺🎯 Снайпер‑пьяница',
-                'berserker': '🪓 Берсерк',
-                'trickster': '🃏 Трикстер',
-                'magnet': '🧲 Магнит',
-                'saboteur': '🕳️ Саботажник',
-                'oracle': '🔮 Оракул',
-                'pyromaniac': '🔥 Пироман',
-                'shieldbearer': '🛡️ Щитоносец',
-                'collector': '📎 Коллектор',
-                'teleporter': '🌀 Телепортер',
-                'rocketeer': '🚀 Говноракетчик',
-                'snot_sniper': '🤧 Сопля‑снайпер',
-                'acid_clown': '🧪🤡 Кислотный клоун',
-                'counter_guru': '🔁 Обратка‑гуру'
-            }
-            role_name = role_names.get(game_result['role_used'], '🎭 Неизвестная роль')
-            result_message += f"\n\n🎭 Роль метателя: {role_name}"
-
-        # Добавляем публичные сигналы в то же сообщение
-        if game_result.get('public_signals'):
-            extras = _format_public_signals(game_result['public_signals'])
-            if extras:
-                result_message += "\n\n" + "\n".join([f"📢 {line}" for line in extras])
-
-        await message.answer(result_message, reply_markup=get_throw_button_with_role(game_result.get('role_used')))
-        return
-
-    # Если аргумент не указан — метаем случайно (как кнопкой)
-    if not message.text or len(message.text.split()) < 2:
-        # Добавляем пользователя в базу
-        await db.add_user(
-            user_id=user.id,
-            username=user.username,
-            first_name=user.first_name,
-            last_name=user.last_name
-        )
-        
-        # Получаем участников чата
-        participants = await get_chat_participants(chat_id)
-        if not participants:
-            # Фоллбэк: берём хотя бы инициатора, чтобы бросок всегда сработал
-            initiator_name = user.username or f"user{user.id}"
-            participants = [(user.id, initiator_name)]
-            logger.info("🧩 Нет участников — используем инициатора как единственную цель для случайного броска")
-
-        # Пытаемся выбрать рандомную цель (не инициатора). Если никого, оставим текущую механику
-        available_targets = [p for p in participants if p[0] != user.id]
-        if available_targets:
-            random_target_id, random_target_username = random.choice(available_targets)
-            logger.info(f"🎯 /go без аргумента: выбран случайный таргет @{random_target_username} ({random_target_id})")
-            game_result = game_logic.process_throw_at_target(
-                initiator_id=user.id,
-                initiator_username=user.username or f"user{user.id}",
-                target_id=random_target_id,
-                target_username=random_target_username,
-                chat_id=chat_id
-            )
-        else:
-            # Обрабатываем случайный бросок по старой логике (когда один в чате)
-            game_result = game_logic.process_throw(
-                initiator_id=user.id,
-                initiator_username=user.username or f"user{user.id}",
-                participants=participants,
-                chat_id=chat_id
-            )
-        
-        # Если кулдаун — показываем сообщение
-        if isinstance(game_result, dict) and game_result.get('error') == 'cooldown':
-            cooldown_msg = await message.answer(
-                f"⏰ {game_result['message']}",
-                reply_markup=get_throw_button()
-            )
-            schedule_auto_delete(cooldown_msg, 5)
-            try:
-                hint_msg = await message.answer("⏰ Подожди немного…")
-                schedule_auto_delete(hint_msg, 5)
-            except Exception:
-                pass
-            return
-        
-        # Сохраняем событие(я)
-        for target in game_result['targets']:
-            await db.add_event(
-                initiator_id=user.id,
-                target_id=target[0],
-                outcome=game_result['outcome'],
-                chat_id=chat_id
-            )
-        
-        # Обновляем статистику
-        await db.update_user_stats(user.id, game_result['outcome'], is_target=False)
-        for target in game_result['targets']:
-            await db.update_user_stats(target[0], game_result['outcome'], is_target=True)
-        
-        # Сообщение результата
-        emoji = game_logic.get_emoji_for_outcome(game_result['outcome'])
-        result_message = f"{emoji} {game_result['message']}"
-        # Добавляем роль к результату
-        if game_result.get('role_used'):
-            role_names = {
-                'sniper': '🎯 Снайпер',
-                'bombardier': '💣 Бомбардир',
-                'defender': '🛡️ Оборонец',
-                'drunk_sniper': '🍺🎯 Снайпер‑пьяница',
-                'berserker': '🪓 Берсерк',
-                'trickster': '🃏 Трикстер',
-                'magnet': '🧲 Магнит',
-                'saboteur': '🕳️ Саботажник',
-                'oracle': '🔮 Оракул',
-                'pyromaniac': '🔥 Пироман',
-                'shieldbearer': '🛡️ Щитоносец',
-                'collector': '📎 Коллектор',
-                'teleporter': '🌀 Телепортер',
-                'rocketeer': '🚀 Говноракетчик',
-                'snot_sniper': '🤧 Сопля‑снайпер',
-                'acid_clown': '🧪🤡 Кислотный клоун',
-                'counter_guru': '🔁 Обратка‑гуру'
-            }
-            role_name = role_names.get(game_result['role_used'], '🎭 Неизвестная роль')
-            result_message += f"\n\n🎭 Роль метателя: {role_name}"
-
-        # Публичные сигналы (в том же сообщении)
-        if game_result.get('public_signals'):
-            extras = _format_public_signals(game_result['public_signals'])
-            if extras:
-                result_message += "\n\n" + "\n".join([f"📢 {line}" for line in extras])
-        await message.answer(
-            result_message,
-            reply_markup=get_throw_button_with_role(game_result.get('role_used'))
-        )
-        return
-    
-    # Извлекаем цель из entities/текста
-    target_username = None
-    # 1) entities: mention (@name) или text_mention (прямой пользователь)
-    try:
-        if message.entities:
-            for ent in message.entities:
-                if ent.type in {"mention", "text_mention"}:
-                    if ent.type == "mention":
-                        target_username = message.text[ent.offset: ent.offset + ent.length]
-                        target_username = target_username.lstrip('@')
-                        break
-                    elif ent.type == "text_mention" and ent.user:
-                        target_username = str(ent.user.id)
-                        break
-    except Exception:
-        pass
-    # 2) если не нашли — поддержим формат без пробела: /go@user
-    if not target_username and message.text and message.text.startswith('/go@'):
-        after = message.text[len('/go@'):]
-        target_username = after.split()[0].strip(',.;:!?)(')
-    # 3) если не нашли — берём второй токен
-    if not target_username:
-        parts = message.text.split(maxsplit=1)
-        if len(parts) > 1:
-            target_username = parts[1].strip()
-    # Чистим от пунктуации по краям и @
-    if target_username:
-        target_username = target_username.strip().strip(',.;:!?)(').lstrip('@')
-    else:
-        # Если вообще ничего не удалось извлечь — fallback в случайный бросок
-        await message.answer("🤷 Не понял, в кого метать. Кидаю наугад.")
-        # Выполняем логику случайного броска напрямую
-        await db.add_user(
-            user_id=user.id,
-            username=user.username,
-            first_name=user.first_name,
-            last_name=user.last_name
-        )
-        participants = await get_chat_participants(chat_id)
-        if not participants:
-            initiator_name = user.username or f"user{user.id}"
-            participants = [(user.id, initiator_name)]
-        available_targets = [p for p in participants if p[0] != user.id]
-        if available_targets:
-            random_target_id, random_target_username = random.choice(available_targets)
-            game_result = game_logic.process_throw_at_target(
-                initiator_id=user.id,
-                initiator_username=user.username or f"user{user.id}",
-                target_id=random_target_id,
-                target_username=random_target_username,
-                chat_id=chat_id
-            )
-        else:
-            game_result = game_logic.process_throw(
-                initiator_id=user.id,
-                initiator_username=user.username or f"user{user.id}",
-                participants=participants,
-                chat_id=chat_id
-            )
-        if isinstance(game_result, dict) and game_result.get('error') == 'cooldown':
-            await message.answer(f"⏰ {game_result['message']}", reply_markup=get_throw_button())
-            try:
-                await message.answer("⏰ Подожди немного…")
-            except Exception:
-                pass
-            return
-        for target in game_result['targets']:
-            await db.add_event(
-                initiator_id=user.id,
-                target_id=target[0],
-                outcome=game_result['outcome'],
-                chat_id=chat_id
-            )
-        await db.update_user_stats(user.id, game_result['outcome'], is_target=False)
-        for target in game_result['targets']:
-            await db.update_user_stats(target[0], game_result['outcome'], is_target=True)
-        emoji = game_logic.get_emoji_for_outcome(game_result['outcome'])
-        result_message = f"{emoji} {game_result['message']}"
-        
-        # Добавляем роль к результату
-        if game_result.get('role_used'):
-            role_names = {
-                'sniper': '🎯 Снайпер',
-                'bombardier': '💣 Бомбардир',
-                'defender': '🛡️ Оборонец',
-                'drunk_sniper': '🍺🎯 Снайпер‑пьяница',
-                'berserker': '🪓 Берсерк',
-                'trickster': '🃏 Трикстер',
-                'magnet': '🧲 Магнит',
-                'saboteur': '🕳️ Саботажник',
-                'oracle': '🔮 Оракул',
-                'pyromaniac': '🔥 Пироман',
-                'shieldbearer': '🛡️ Щитоносец',
-                'collector': '📎 Коллектор',
-                'teleporter': '🌀 Телепортер',
-                'rocketeer': '🚀 Говноракетчик',
-                'snot_sniper': '🤧 Сопля‑снайпер',
-                'acid_clown': '🧪🤡 Кислотный клоун',
-                'counter_guru': '🔁 Обратка‑гуру'
-            }
-            role_name = role_names.get(game_result['role_used'], '🎭 Неизвестная роль')
-            result_message += f"\n\n🎭 Роль метателя: {role_name}"
-        
-        # Добавляем публичные сигналы в то же сообщение
-        if game_result.get('public_signals'):
-            extras = _format_public_signals(game_result['public_signals'])
-            if extras:
-                result_message += "\n\n" + "\n".join([f"📢 {line}" for line in extras])
-
-        await message.answer(result_message, reply_markup=get_throw_button_with_role(game_result.get('role_used')))
-        return
-    logger.info(f"🎯 Цель команды /go: @{target_username}")
-    
-    # Добавляем пользователя в базу
-    await db.add_user(
-        user_id=user.id,
-        username=user.username,
-        first_name=user.first_name,
-        last_name=user.last_name
-    )
-    
-    # Получаем участников чата
-    participants = await get_chat_participants(chat_id)
-    # Даже если участников нет, продолжаем: позволяем кидать в произвольный username (виртуальная цель)
-    
-    # Ищем цель по имени или username
-    target_user = None
-    # Сначала пробуем найти по ID, если аргумент — число
-    if target_username.isdigit():
-        numeric_id = int(target_username)
-        for user_id, display_name in participants:
-            if user_id == numeric_id:
-                target_user = (user_id, display_name or f"user{user_id}")
-                break
-    # Затем ищем по username/отображаемому имени (без учёта регистра)
-    if target_user is None:
-        for user_id, display_name in participants:
-            if not display_name:
-                continue
-            name_l = display_name.lower()
-            arg_l = target_username.lower()
-            if name_l == arg_l or name_l.startswith(arg_l):
-                target_user = (user_id, display_name)
-                break
-    
-    if not target_user:
-        # Разрешаем метнуть в любого username: создаём виртуального пользователя
-        virtual_id = _virtual_user_id_from_username(target_username.lower())
-        target_user = (virtual_id, target_username)
-        logger.info(f"🧩 Цель @{target_username} не найдена в участниках. Используем виртуальный ID {virtual_id}")
-        
-        # Сохраняем в seen и в БД (как пользователя без активности)
-        chat_seen_users.setdefault(chat_id, {})[virtual_id] = target_username
-        try:
-            await db.add_user(user_id=virtual_id, username=target_username)
-        except Exception:
-            pass
-    
-    # Проверяем, что цель не является самим метателем
-    if target_user[0] == user.id:
-        error_msg = await message.answer(
-            "🤡 Нельзя метать говно в самого себя! Попробуйте другую цель.",
-            reply_markup=get_throw_button()
-        )
-        
-        # Удаляем сообщение об ошибке через 5 секунд
-        await asyncio.sleep(5)
-        try:
-            await error_msg.delete()
-            logger.debug(f"🗑️ Сообщение об ошибке команды /go от {user.username} удалено")
-        except Exception as e:
-            logger.warning(f"⚠️ Не удалось удалить сообщение об ошибке от {user.username}: {e}")
-        
-        return
-    
-    # Обрабатываем бросок в конкретную цель
-    game_result = game_logic.process_throw_at_target(
-        initiator_id=user.id,
-        initiator_username=user.username or f"user{user.id}",
-        target_id=target_user[0],
-        target_username=target_user[1],
-        chat_id=chat_id
-    )
-    
-    # Если кулдаун — показываем сообщение и удаляем через 5 сек
-    if isinstance(game_result, dict) and game_result.get('error') == 'cooldown':
-        cooldown_msg = await message.answer(
-            f"⏰ {game_result['message']}",
-            reply_markup=get_throw_button()
-        )
-        await asyncio.sleep(5)
-        try:
-            await cooldown_msg.delete()
-        except Exception:
-            pass
-        return
-    
-    # Проверяем на ошибки (кулдаун, самоцель и т.д.)
-    if 'error' in game_result:
-        error_msg = await message.answer(
-            game_result['message'],
-            reply_markup=get_throw_button()
-        )
-        # Удаляем сообщение об ошибке через 5 секунд
-        await asyncio.sleep(5)
-        try:
-            await error_msg.delete()
-        except Exception:
-            pass
-        return
-    
-    # Обновляем расширенные данные пользователя в БД
-    await db.update_user_heat(user.id, game_result.get('heat_at_throw', 0))
-    await db.update_score(user.id, game_result.get('score_delta', 0))
-    if game_result.get('role_used'):
-        expires_at = datetime.now() + timedelta(seconds=3600)  # 1 час
-        await db.update_user_role(user.id, game_result['role_used'], expires_at.isoformat())
-    await db.update_user_last_throw(user.id)
-    
-    # Добавляем событие в базу с новыми полями
-    await db.add_event(
-        initiator_id=user.id,
-        target_id=target_user[0],
-        outcome=game_result['outcome'],
-        chat_id=chat_id,
-        role_used=game_result.get('role_used'),
-        stacks_at_hit=game_result.get('focus_stacks', 0),
-        heat_at_hit=game_result.get('heat_at_throw', 0),
-        was_reflect=0,  # TODO: реализовать отражение
-        targets_json=str(game_result['targets'])
-    )
-    
-    # Обновляем фокус в БД
-    focus_stacks = game_result.get('focus_stacks', 0)
-    penalty_until = None
-    if focus_stacks > 3:  # Штраф за фокус
-        penalty_until = (datetime.now() + timedelta(seconds=300)).isoformat()  # 5 минут
-    await db.set_focus(user.id, target_user[0], chat_id, focus_stacks, penalty_until)
-    
-    # Обновляем базовую статистику
-    await db.update_user_stats(user.id, game_result['outcome'], is_target=False)
-    await db.update_user_stats(target_user[0], game_result['outcome'], is_target=True)
-    
-    # Формируем сообщение с результатом
-    emoji = game_logic.get_emoji_for_outcome(game_result['outcome'])
-    result_message = f"{emoji} {game_result['message']}"
-    
-    # Добавляем информацию о роли и heat
-    if game_result.get('role_used'):
-        role_names = {
-            'sniper': '🎯 Снайпер',
-            'bombardier': '💣 Бомбардир', 
-            'defender': '🛡️ Оборонец',
-            'drunk_sniper': '🍺🎯 Снайпер‑пьяница',
-            'berserker': '🪓 Берсерк',
-            'trickster': '🃏 Трикстер',
-            'magnet': '🧲 Магнит',
-            'saboteur': '🕳️ Саботажник',
-            'oracle': '🔮 Оракул',
-            'pyromaniac': '🔥 Пироман',
-            'shieldbearer': '🛡️ Щитоносец',
-            'collector': '📎 Коллектор',
-            'teleporter': '🌀 Телепортер',
-            'rocketeer': '🚀 Говноракетчик',
-            'snot_sniper': '🤧 Сопля‑снайпер',
-            'acid_clown': '🧪🤡 Кислотный клоун',
-            'counter_guru': '🔁 Обратка‑гуру'
-        }
-        role_name = role_names.get(game_result['role_used'], '🎭 Неизвестная роль')
-        result_message += f"\n\n🎭 Роль метателя: {role_name}"
-    
-    if game_result.get('heat_at_throw', 0) > 50:
-        result_message += f"\n🔥 Репутация агрессора: {game_result['heat_at_throw']}/100"
-    
-    # Добавляем публичные сигналы в то же сообщение
-    if game_result.get('public_signals'):
-        extras = _format_public_signals(game_result['public_signals'])
-        if extras:
-            result_message += "\n\n" + "\n".join([f"📢 {line}" for line in extras])
-
-    # Отправляем результат
-    await message.answer(
-        result_message,
-        reply_markup=get_throw_button_with_role(game_result.get('role_used'))
-    )
-    
-    # Больше не удаляем сообщение команды /go
-    
-    logger.info(f"✅ Целевой бросок завершен: {user.username} -> {target_user[1]} -> {game_result['outcome']}")
 
 # Убрали отдельный алиас для /go@user, чтобы избежать двойных срабатываний
 
